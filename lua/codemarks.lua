@@ -53,7 +53,7 @@ end
 
 -- Rename references of a code mark in notes files
 local function escape_pattern(str)
-  return str:gsub("([^%%w])", "%%%%%%1")
+  return str:gsub("([^%w])", "%%%1")
 end
 
 function M.rename_references(old_name, new_name)
@@ -75,7 +75,7 @@ function M.rename_references(old_name, new_name)
           -- Replace [[old_name]] with [[new_name]]
           local new_content, replacements1 = content:gsub("mark:" .. escaped_old, "mark:" .. new_name)
           local replacements2
-          new_content, replacements2 = new_content:gsub("%%[%%[" .. escaped_old .. "%%]%%]", "[[" .. new_name .. "]]")
+          new_content, replacements2 = new_content:gsub("%[%[" .. escaped_old .. "%]%]", "[[" .. new_name .. "]]")
           
           if replacements1 > 0 or replacements2 > 0 then
             local wf = io.open(file, "w")
@@ -128,12 +128,12 @@ function M.get_mark_under_cursor()
   -- 1. Pattern: [text](url) where url is mark:<name>
   local start_idx = 1
   while true do
-    local s, e, text, url = line:find("%%[([^%%]]+)%%]%%(([^%%)]+)%%)", start_idx)
+    local s, e, text, url = line:find("%[([^%]]+)%]%(([^%)]+)%)", start_idx)
     if not s then break end
     if col >= s and col <= e then
       local name = url:match("^mark:(.+)$")
       if name then
-        name = name:gsub("^%%s+", ""):gsub("%%s+$", "")
+        name = name:gsub("^%s+", ""):gsub("%s+$", "")
         if M.is_mark_in_db(name) then
           return name
         end
@@ -145,16 +145,16 @@ function M.get_mark_under_cursor()
   -- 2. Pattern: [[(.-)]] (wikilink style, allows any chars inside brackets)
   start_idx = 1
   while true do
-    local s, e, raw_name = line:find("%%[%%[([^%%]]+)%%]%%]", start_idx)
+    local s, e, raw_name = line:find("%[%[([^%]]+)%]%]", start_idx)
     if not s then break end
     if col >= s and col <= e then
       local name = raw_name:gsub("^mark:", "")
-      name = name:gsub("^%%s+", ""):gsub("%%s+$", "")
+      name = name:gsub("^%s+", ""):gsub("%s+$", "")
       local pipe_idx = name:find("|")
       if pipe_idx then
         name = name:sub(1, pipe_idx - 1)
       end
-      name = name:gsub("^%%s+", ""):gsub("%%s+$", "")
+      name = name:gsub("^%s+", ""):gsub("%s+$", "")
       if M.is_mark_in_db(name) then
         return name
       end
@@ -165,11 +165,11 @@ function M.get_mark_under_cursor()
   -- 3. Pattern: mark:([%w_%%-%%s%%.%%/%%:]+)
   start_idx = 1
   while true do
-    local s, e, raw_name = line:find("mark:([%%w_%%-%%s%%.%%/%%:]+)", start_idx)
+    local s, e, raw_name = line:find("mark:([%w_%-%s%.%/%:]+)", start_idx)
     if not s then break end
     if col >= s and col <= e then
       local words = {}
-      for word in raw_name:gmatch("%%S+") do
+      for word in raw_name:gmatch("%S+") do
         table.insert(words, word)
       end
       local candidate = ""
@@ -180,7 +180,7 @@ function M.get_mark_under_cursor()
         else
           candidate = candidate .. " " .. w
         end
-        local clean_candidate = candidate:gsub("[%%.%%,;%%?%%!]$", "")
+        local clean_candidate = candidate:gsub("[%.,;%?!]$", "")
         if M.is_mark_in_db(candidate) then
           best_match = candidate
         elseif M.is_mark_in_db(clean_candidate) then
@@ -217,9 +217,9 @@ function M.create_mark()
       return
     end
     
-    local clean_name = name:match("^[^%%[%%]%%(%%)|]+$")
+    local clean_name = name:match("^[^%[%]%(%)|]+$")
     if clean_name then
-      clean_name = clean_name:gsub("^%%s+", ""):gsub("%%s+$", "")
+      clean_name = clean_name:gsub("^%s+", ""):gsub("%s+$", "")
     end
     if not clean_name or clean_name == "" then
       vim.notify("Mark name cannot contain brackets, parentheses, or pipe characters", vim.log.levels.ERROR)
@@ -340,9 +340,9 @@ function M.edit_mark()
       if action == "Rename" then
         vim.ui.input({ prompt = "New name for " .. mark_id .. ": ", default = mark_id }, function(new_name)
           if not new_name or new_name == "" or new_name == mark_id then return end
-          local clean_new = new_name:match("^[^%%[%%]%%(%%)|]+$")
+          local clean_new = new_name:match("^[^%[%]%(%)|]+$")
           if clean_new then
-            clean_new = clean_new:gsub("^%%s+", ""):gsub("%%s+$", "")
+            clean_new = clean_new:gsub("^%s+", ""):gsub("%s+$", "")
           end
           if not clean_new or clean_new == "" then
             vim.notify("Mark name cannot contain brackets, parentheses, or pipe characters", vim.log.levels.ERROR)
