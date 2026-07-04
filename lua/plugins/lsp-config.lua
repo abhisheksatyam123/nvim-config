@@ -70,8 +70,69 @@ return {
           local client = vim.lsp.get_client_by_id(ev.data.client_id)
           local opts = { buffer = bufnr, noremap = true, silent = true }
 
+          local function clangd_source_definition_or_lsp()
+            local word = vim.fn.expand("<cword>")
+            local file = vim.api.nvim_buf_get_name(bufnr)
+            local root = (client and client.config and client.config.root_dir)
+              or (vim.fs.root and vim.fs.root(file, { "compile_commands.json", ".git" }))
+              or vim.fn.getcwd()
+
+            local function jump_to_first_rg_match(matches)
+              if vim.v.shell_error ~= 0 or #matches == 0 then
+                return false
+              end
+              local target, line, col = matches[1]:match("^(.-):(%d+):(%d+):")
+              if not target then
+                return false
+              end
+              vim.cmd("edit " .. vim.fn.fnameescape(target))
+              vim.api.nvim_win_set_cursor(0, { tonumber(line), math.max(tonumber(col) - 1, 0) })
+              vim.cmd("normal! zz")
+              return true
+            end
+
+            if word ~= "" then
+              local names = { word }
+              if not word:match("^_") then
+                table.insert(names, "_" .. word)
+              end
+
+              for _, name in ipairs(names) do
+                -- Prefer real C function bodies over macro/declaration targets.
+                -- This handles public macros such as offldmgr_foo -> _offldmgr_foo.
+                local pattern = "^[[:space:]]*[A-Za-z_][A-Za-z0-9_[:space:]*]*[[:space:]*]+" .. name .. "[[:space:]]*\\("
+                if jump_to_first_rg_match(vim.fn.systemlist({ "rg", "--vimgrep", "--glob", "*.c", pattern, root })) then
+                  return
+                end
+              end
+
+              -- clangd sometimes misses macro/type/enum locations while the index is stale.
+              -- Prefer exact header/source declarations before falling back to LSP.
+              for _, name in ipairs(names) do
+                local symbol_patterns = {
+                  "^[[:space:]]*(typedef[[:space:]]+)?(struct|union|enum)[[:space:]]+" .. name .. "\\b",
+                  "^[[:space:]]*#[[:space:]]*define[[:space:]]+" .. name .. "\\b",
+                  "^[[:space:]]*" .. name .. "[[:space:]]*=",
+                  "^[[:space:]]*}[[:space:]]*" .. name .. "[[:space:]]*;",
+                  "^[[:space:]]*typedef[[:space:]].*\\b" .. name .. "[[:space:]]*;",
+                }
+                for _, pattern in ipairs(symbol_patterns) do
+                  if jump_to_first_rg_match(vim.fn.systemlist({ "rg", "--vimgrep", "--glob", "*.[ch]", pattern, root })) then
+                    return
+                  end
+                end
+              end
+            end
+
+            vim.lsp.buf.definition()
+          end
+
           -- Navigation
-          vim.keymap.set("n", "gd", vim.lsp.buf.definition,      vim.tbl_extend("force", opts, { desc = "Go to definition" }))
+          if client and client.name == "clangd" then
+            vim.keymap.set("n", "gd", clangd_source_definition_or_lsp, vim.tbl_extend("force", opts, { desc = "Go to C source definition" }))
+          else
+            vim.keymap.set("n", "gd", vim.lsp.buf.definition, vim.tbl_extend("force", opts, { desc = "Go to definition" }))
+          end
           vim.keymap.set("n", "gD", vim.lsp.buf.declaration,     vim.tbl_extend("force", opts, { desc = "Go to declaration" }))
           vim.keymap.set("n", "gr", vim.lsp.buf.references,      vim.tbl_extend("force", opts, { desc = "Find references" }))
           vim.keymap.set("n", "gi", vim.lsp.buf.implementation,  vim.tbl_extend("force", opts, { desc = "Go to implementation" }))
@@ -183,8 +244,12 @@ return {
       vim.lsp.config("clangd", {
         cmd = {
           "/usr/local/bin/clangd",
+          "--enable-config",
           "--background-index",
-          "--clang-tidy",
+          "--background-index-priority=background",
+          "-j=2",
+          "--pch-storage=disk",
+          "--malloc-trim",
           "--header-insertion=iwyu",
           "--completion-style=detailed",
           "--function-arg-placeholders",
@@ -207,10 +272,10 @@ return {
       })
 
       -- Markdown Oxide (PKM Markdown LSP) — built locally from source.
-      -- To update: cd /local/mnt/workspace/qprojects/markdown-oxide && cargo build --release
+      -- To update: cd /home/abhi/qprojects/markdown-oxide && cargo build --release
       -- Then :LspRestart in nvim.
       vim.lsp.config("markdown_oxide", {
-        cmd = { "/local/mnt/workspace/qprojects/markdown-oxide/target/release/markdown-oxide" },
+        cmd = { "/home/abhi/qprojects/markdown-oxide/target/release/markdown-oxide" },
         filetypes = { "markdown" },
         -- Extend capabilities: enable willSaveWaitUntil and watched-file dynamic registration
         capabilities = vim.tbl_deep_extend("force", capabilities, {
@@ -225,6 +290,55 @@ return {
             },
           },
         }),
+        handlers = {
+          ["textDocument/publishDiagnostics"] = function(err, result, ctx, config)
+            if result and result.diagnostics then
+              local filtered = {}
+              local ok, codemarks = pcall(require, "codemarks")
+              if ok then
+                for _, d in ipairs(result.diagnostics) do
+                  local keep = true
+                  if d.message and d.message:find("Unresolved Reference") then
+                    local bufnr = vim.uri_to_bufnr(result.uri)
+                    if vim.api.nvim_buf_is_loaded(bufnr) then
+                      local range = d.range
+                      local start_line = range.start.line
+                      local start_col = range.start.character
+                      local end_line = range["end"].line
+                      local end_col = range["end"].character
+                      
+                      local lines = vim.api.nvim_buf_get_lines(bufnr, start_line, end_line + 1, false)
+                      if #lines > 0 then
+                        local text
+                        if #lines == 1 then
+                          text = lines[1]:sub(start_col + 1, end_col)
+                        else
+                          text = lines[1]:sub(start_col + 1)
+                        end
+                        
+                        if text then
+                          local ref_name = text:gsub("^%[%[", ""):gsub("%]%]$", "")
+                          ref_name = ref_name:gsub("^mark:", "")
+                          ref_name = ref_name:match("%((.-)%)") or ref_name
+                          ref_name = ref_name:gsub("^mark:", "")
+                          ref_name = ref_name:gsub("^%s+", ""):gsub("%s+$", "")
+                          if codemarks.is_mark_in_db(ref_name) then
+                            keep = false
+                          end
+                        end
+                      end
+                    end
+                  end
+                  if keep then
+                    table.insert(filtered, d)
+                  end
+                end
+                result.diagnostics = filtered
+              end
+            end
+            vim.lsp.handlers["textDocument/publishDiagnostics"](err, result, ctx, config)
+          end
+        },
         root_markers = { ".git", ".obsidian", ".moxide.toml" },
         on_attach = function(client, bufnr)
           -- Enable inlay hints for markdown buffers if supported
@@ -309,11 +423,17 @@ return {
         "lua", "html", "css", "json", "javascript", "typescript",
         "markdown", "markdown_inline",
       },
-      highlight = { enable = true, additional_vim_regex_highlighting = false },
-      indent = { enable = true },
+      -- Treesitter markdown + conceallevel>0 triggers conceal_line errors on
+      -- Neovim 0.12.x; Obsidian UI uses extmarks and sets conceallevel per-buffer.
+      highlight = {
+        enable = true,
+        additional_vim_regex_highlighting = false,
+        disable = { "markdown" },
+      },
+      indent = { enable = true, disable = { "markdown" } },
     },
     config = function(_, opts)
-      require("nvim-treesitter.configs").setup(opts)
+      require("nvim-treesitter").setup(opts)
     end,
   },
 }

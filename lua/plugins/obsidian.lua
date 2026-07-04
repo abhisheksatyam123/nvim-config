@@ -75,6 +75,11 @@ return {
           ObsidianP2 = { bold = true, fg = "#ffcb6b" },
           ObsidianP3 = { bold = true, fg = "#89ddff" },
           ObsidianDeferred = { italic = true, fg = "#676e95" },
+          ObsidianRefText = { underline = true, fg = "#ffcb6b" },
+          ObsidianExtLinkIcon = { fg = "#ffcb6b" },
+          ObsidianTag = { italic = true, fg = "#89ddff" },
+          ObsidianBlockID = { italic = true, fg = "#89ddff" },
+          ObsidianHighlightText = { bg = "#75662e" },
         },
       },
     })
