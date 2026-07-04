@@ -52,6 +52,10 @@ function M.find_references(name)
 end
 
 -- Rename references of a code mark in notes files
+local function escape_pattern(str)
+  return str:gsub("([^%%w])", "%%%%%%1")
+end
+
 function M.rename_references(old_name, new_name)
   local files = M.find_references(old_name)
   if #files == 0 then return end
@@ -61,6 +65,7 @@ function M.rename_references(old_name, new_name)
   }, function(choice)
     if choice == "Yes" then
       local count = 0
+      local escaped_old = escape_pattern(old_name)
       for _, file in ipairs(files) do
         local f = io.open(file, "r")
         if f then
@@ -68,9 +73,9 @@ function M.rename_references(old_name, new_name)
           f:close()
           -- Replace mark:old_name with mark:new_name
           -- Replace [[old_name]] with [[new_name]]
-          local new_content, replacements1 = content:gsub("mark:" .. old_name, "mark:" .. new_name)
+          local new_content, replacements1 = content:gsub("mark:" .. escaped_old, "mark:" .. new_name)
           local replacements2
-          new_content, replacements2 = new_content:gsub("%[%[" .. old_name .. "%]%]", "[[" .. new_name .. "]]")
+          new_content, replacements2 = new_content:gsub("%%[%%[" .. escaped_old .. "%%]%%]", "[[" .. new_name .. "]]")
           
           if replacements1 > 0 or replacements2 > 0 then
             local wf = io.open(file, "w")
@@ -123,12 +128,15 @@ function M.get_mark_under_cursor()
   -- 1. Pattern: [text](url) where url is mark:<name>
   local start_idx = 1
   while true do
-    local s, e, text, url = line:find("%[([^%]]+)%]%(([^%)]+)%)", start_idx)
+    local s, e, text, url = line:find("%%[([^%%]]+)%%]%%(([^%%)]+)%%)", start_idx)
     if not s then break end
     if col >= s and col <= e then
-      local name = url:match("^mark:([%w_%-]+)$")
-      if name and M.is_mark_in_db(name) then
-        return name
+      local name = url:match("^mark:(.+)$")
+      if name then
+        name = name:gsub("^%%s+", ""):gsub("%%s+$", "")
+        if M.is_mark_in_db(name) then
+          return name
+        end
       end
     end
     start_idx = e + 1
@@ -137,10 +145,16 @@ function M.get_mark_under_cursor()
   -- 2. Pattern: [[(.-)]] (wikilink style, allows any chars inside brackets)
   start_idx = 1
   while true do
-    local s, e, raw_name = line:find("%[%[([^%]]+)%]%]", start_idx)
+    local s, e, raw_name = line:find("%%[%%[([^%%]]+)%%]%%]", start_idx)
     if not s then break end
     if col >= s and col <= e then
       local name = raw_name:gsub("^mark:", "")
+      name = name:gsub("^%%s+", ""):gsub("%%s+$", "")
+      local pipe_idx = name:find("|")
+      if pipe_idx then
+        name = name:sub(1, pipe_idx - 1)
+      end
+      name = name:gsub("^%%s+", ""):gsub("%%s+$", "")
       if M.is_mark_in_db(name) then
         return name
       end
@@ -148,14 +162,30 @@ function M.get_mark_under_cursor()
     start_idx = e + 1
   end
 
-  -- 3. Pattern: mark:([%w_%-]+)
+  -- 3. Pattern: mark:([%w_%%-%%s]+)
   start_idx = 1
   while true do
-    local s, e, name = line:find("mark:([%w_%-]+)", start_idx)
+    local s, e, raw_name = line:find("mark:([%%w_%%-%%s]+)", start_idx)
     if not s then break end
     if col >= s and col <= e then
-      if M.is_mark_in_db(name) then
-        return name
+      local words = {}
+      for word in raw_name:gmatch("%%S+") do
+        table.insert(words, word)
+      end
+      local candidate = ""
+      local best_match = nil
+      for i, w in ipairs(words) do
+        if i == 1 then
+          candidate = w
+        else
+          candidate = candidate .. " " .. w
+        end
+        if M.is_mark_in_db(candidate) then
+          best_match = candidate
+        end
+      end
+      if best_match then
+        return best_match
       end
     end
     start_idx = e + 1
@@ -184,9 +214,12 @@ function M.create_mark()
       return
     end
     
-    local clean_name = name:match("^[%w_%-]+$")
-    if not clean_name then
-      vim.notify("Mark name must be alphanumeric with hyphens/underscores only", vim.log.levels.ERROR)
+    local clean_name = name:match("^[%%w_%%-%%s]+$")
+    if clean_name then
+      clean_name = clean_name:gsub("^%%s+", ""):gsub("%%s+$", "")
+    end
+    if not clean_name or clean_name == "" then
+      vim.notify("Mark name must be alphanumeric with spaces, hyphens, or underscores only", vim.log.levels.ERROR)
       return
     end
 
@@ -304,9 +337,12 @@ function M.edit_mark()
       if action == "Rename" then
         vim.ui.input({ prompt = "New name for " .. mark_id .. ": ", default = mark_id }, function(new_name)
           if not new_name or new_name == "" or new_name == mark_id then return end
-          local clean_new = new_name:match("^[%w_%-]+$")
-          if not clean_new then
-            vim.notify("Mark name must be alphanumeric with hyphens/underscores only", vim.log.levels.ERROR)
+          local clean_new = new_name:match("^[%%w_%%-%%s]+$")
+          if clean_new then
+            clean_new = clean_new:gsub("^%%s+", ""):gsub("%%s+$", "")
+          end
+          if not clean_new or clean_new == "" then
+            vim.notify("Mark name must be alphanumeric with spaces, hyphens, or underscores only", vim.log.levels.ERROR)
             return
           end
           local dup = db:select("marks", { where = { id = clean_new } })
