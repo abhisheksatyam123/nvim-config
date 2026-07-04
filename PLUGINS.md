@@ -12,14 +12,15 @@ This document explains the purpose and key features of the currently active plug
 
 ## 🔍 Navigation & Search
 
-- **Fzf-Lua** (`fzf-lua.lua`): A blazingly fast fuzzy finder for files, grep search, and buffers.
-  - `<leader>ff`: Find files
-  - `<leader>fg`: Live grep
-  - `<leader>fb`: Buffers
-- **Telescope** (`telescope.lua`): A highly extensible fuzzy finder. Mostly acts as a dependency/UI selector for other plugins (like Harpoon, Todo-Comments).
+- **Fzf-Lua** (`fzf-lua.lua`): The primary, blazingly fast fuzzy finder for files, grep search, and buffers. Optimized to use the external `fzf` and `fd` binaries, respecting `.gitignore` and displaying filenames first.
+  - `<leader>ff`: Find files (with filename first)
+  - `<leader>fg`: Live grep (search text inside files)
+  - `<leader>fb`: Search open buffers
+  - `<leader>fh`: Search help tags
+- **Telescope** (`telescope.lua`): A highly extensible fuzzy finder. Its primary global keymaps are disabled to prioritize `fzf-lua`, but it remains active as an API library/UI dependency for other plugins like Harpoon and CodeMarks.
 - **Harpoon 2** (`harpoon.lua`): Allows you to "pin" your most frequently used files for instant jumping.
   - `<leader>hm`: Add file to Harpoon
-  - `<leader>ha`: Toggle Harpoon list
+  - `<leader>ha`: Toggle Harpoon list (uses Telescope UI)
   - `<leader>hn`/`<leader>hp`: Jump to next/prev Harpoon
 - **Oil** (`oil.lua`): A unique file explorer that lets you edit your filesystem like a normal Neovim buffer.
   - `-` (hyphen): Open Oil explorer
@@ -42,7 +43,7 @@ This document explains the purpose and key features of the currently active plug
   - `<leader>aa`: Toggle AI Chat
 - **Autopairs & Autotag** (`autopairs.lua`): Essential automation that automatically closes brackets, quotes, and HTML/React tags as you type.
 
-## � Diagnostics & Maintenance
+## 🔍 Diagnostics & Maintenance
 
 - **Trouble** (`trouble.lua`): A centralized dashboard for all code errors and warnings (diagnostics) across the workspace.
   - `<leader>xx`: Toggle Trouble diagnostics list.
@@ -59,6 +60,11 @@ This document explains the purpose and key features of the currently active plug
 
 ## 🧰 Specialized Plugins
 
+- **CodeMarks** (`codemarks.lua`): A custom local bookmarking database. Allows you to set named code marks at specific lines and navigate back to them (handling line drift automatically).
+  - `<leader>mc`: Create mark at cursor
+  - `<leader>md`: Delete mark
+  - `<leader>me`: Edit mark metadata
+  - `<leader>fm`: Search marks (using Telescope UI)
 - **Obsidian** (`obsidian.lua`): A powerful integration for Second Brain / Zettelkasten note-taking. Handles wiki-links, daily notes, and Spaced Repetition (SRS).
 - **Cscope-Maps** (`cscope.lua`): Provides shortcuts for Cscope, useful for navigating large C/C++ projects by tracking callers and definitions.
   - `<leader>cs...`: Various search operations.
