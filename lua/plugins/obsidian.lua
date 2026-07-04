@@ -1,5 +1,5 @@
 return {
-  dir = "/local/mnt/workspace/qprojects/obsidian.nvim_abhi",
+  dir = "/home/abhi/qprojects/obsidian.nvim_abhi",
   name = "obsidian.nvim",
   lazy = true,
   ft = "markdown",
@@ -11,7 +11,7 @@ return {
       workspaces = {
         {
           name = "personal",
-          path = "/local/mnt/workspace/notes",
+          path = "~/notes",
         },
       },
 

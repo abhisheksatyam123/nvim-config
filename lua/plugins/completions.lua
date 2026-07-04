@@ -16,6 +16,42 @@ return {
       local cmp = require("cmp")
       require("luasnip.loaders.from_vscode").lazy_load()
 
+      local cmp_border = {
+        { "┌", "CmpBorder" },
+        { "─", "CmpBorder" },
+        { "┐", "CmpBorder" },
+        { "│", "CmpBorder" },
+        { "┘", "CmpBorder" },
+        { "─", "CmpBorder" },
+        { "└", "CmpBorder" },
+        { "│", "CmpBorder" },
+      }
+
+      local cmp_doc_border = {
+        { "┌", "CmpDocBorder" },
+        { "─", "CmpDocBorder" },
+        { "┐", "CmpDocBorder" },
+        { "│", "CmpDocBorder" },
+        { "┘", "CmpDocBorder" },
+        { "─", "CmpDocBorder" },
+        { "└", "CmpDocBorder" },
+        { "│", "CmpDocBorder" },
+      }
+
+      local bordered = function()
+        return cmp.config.window.bordered({
+          border = cmp_border,
+          winhighlight = "Normal:CmpPmenu,FloatBorder:CmpBorder,CursorLine:PmenuSel,Search:None",
+        })
+      end
+
+      local bordered_docs = function()
+        return cmp.config.window.bordered({
+          border = cmp_doc_border,
+          winhighlight = "Normal:CmpDoc,FloatBorder:CmpDocBorder,CursorLine:PmenuSel,Search:None",
+        })
+      end
+
       cmp.setup({
         snippet = {
           expand = function(args)
@@ -23,8 +59,8 @@ return {
           end,
         },
         window = {
-          completion = cmp.config.window.bordered(),
-          documentation = cmp.config.window.bordered(),
+          completion = bordered(),
+          documentation = bordered_docs(),
         },
         mapping = cmp.mapping.preset.insert({
           ["<C-b>"] = cmp.mapping.scroll_docs(-4),
@@ -33,12 +69,9 @@ return {
           ["<C-e>"] = cmp.mapping.abort(),
           ["<CR>"] = cmp.mapping.confirm({ select = true }),
         }),
-        sources = cmp.config.sources({
+        sources = {
           { name = "nvim_lsp" },
-          { name = "luasnip" },
-        }, {
-          { name = "buffer" },
-        }),
+        },
       })
     end,
   },

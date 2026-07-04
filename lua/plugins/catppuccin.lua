@@ -8,6 +8,22 @@ return {
     config = function()
       require("catppuccin").setup({
         transparent_background = false,
+        custom_highlights = function(colors)
+          return {
+            -- Global float surfaces (hover, diagnostics, signature help)
+            NormalFloat = { bg = colors.mantle },
+            FloatBorder = { fg = colors.blue, bg = colors.mantle, bold = true },
+            FloatTitle = { fg = colors.blue, bg = colors.mantle, bold = true },
+            HoverFloat = { fg = colors.text, bg = colors.base },
+            HoverBorder = { fg = colors.red, bg = colors.mantle, bold = true },
+
+            -- Completion popup surfaces
+            CmpPmenu = { bg = colors.crust },
+            CmpDoc = { bg = colors.crust },
+            CmpBorder = { fg = colors.yellow, bg = colors.crust, bold = true },
+            CmpDocBorder = { fg = colors.green, bg = colors.crust, bold = true },
+          }
+        end,
       })
       vim.cmd.colorscheme "catppuccin"
     end
