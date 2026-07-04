@@ -40,7 +40,6 @@ This document explains the purpose and key features of the currently active plug
 - **CodeCompanion** (`codecompanion.lua`): Your AI assistant within Neovim. It uses Gemini to provide chat and inline code suggestions.
   - `<leader>a`: AI Actions
   - `<leader>aa`: Toggle AI Chat
-- **AutoSave** (`autosave.lua`): Automatically saves your changes as soon as you enter Insert Mode.
 - **Autopairs & Autotag** (`autopairs.lua`): Essential automation that automatically closes brackets, quotes, and HTML/React tags as you type.
 
 ## � Diagnostics & Maintenance
