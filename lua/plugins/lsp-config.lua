@@ -337,61 +337,72 @@ return {
               end
             end
             vim.lsp.handlers["textDocument/publishDiagnostics"](err, result, ctx, config)
-          end,
-          ["textDocument/semanticTokens/full"] = function(err, result, ctx, config)
-            if not err and result and result.data then
-              local ok, codemarks = pcall(require, "codemarks")
-              if ok then
-                local bufnr = ctx.bufnr
-                local data = result.data
-                local current_line = 0
-                local current_col = 0
-                for i = 1, #data, 5 do
-                  local delta_line = data[i]
-                  local delta_start = data[i+1]
-                  local length = data[i+2]
-                  local token_type = data[i+3]
-                  
-                  if delta_line > 0 then
-                    current_line = current_line + delta_line
-                    current_col = delta_start
-                  else
-                    current_col = current_col + delta_start
-                  end
-                  
-                  if token_type == 1 then
-                    local lines = vim.api.nvim_buf_get_lines(bufnr, current_line, current_line + 1, false)
-                    if #lines > 0 then
-                      local line_text = lines[1]
-                      local token_text = line_text:sub(current_col + 1, current_col + length)
-                      if token_text then
-                        local ref_name = token_text
-                        local target_in_parens = ref_name:match("%((.-)%)")
-                        if target_in_parens then
-                          ref_name = target_in_parens
-                        else
-                          ref_name = ref_name:gsub("^%[%[", ""):gsub("%]%]$", "")
-                          local pipe_idx = ref_name:find("|")
-                          if pipe_idx then
-                            ref_name = ref_name:sub(1, pipe_idx - 1)
-                          end
-                        end
-                        ref_name = ref_name:gsub("^mark:", "")
-                        ref_name = ref_name:gsub("^%s+", ""):gsub("%s+$", "")
-                        if codemarks.is_mark_in_db(ref_name) then
-                          data[i+3] = 0 -- Change to resolved
-                        end
-                      end
-                    end
-                  end
-                end
-              end
-            end
-            vim.lsp.handlers["textDocument/semanticTokens/full"](err, result, ctx, config)
           end
         },
         root_markers = { ".git", ".obsidian", ".moxide.toml" },
         on_attach = function(client, bufnr)
+          -- Intercept semantic tokens to mark resolved codemarks as resolved
+          if not client._request_overridden then
+            client._request_overridden = true
+            local orig_request = client.request
+            client.request = function(self, method, params, handler, bufnr)
+              if method == "textDocument/semanticTokens/full" and handler then
+                local orig_handler = handler
+                handler = function(err, result, ctx, config)
+                  if not err and result and result.data then
+                    local ok, codemarks = pcall(require, "codemarks")
+                    if ok then
+                      local data = result.data
+                      local current_line = 0
+                      local current_col = 0
+                      for i = 1, #data, 5 do
+                        local delta_line = data[i]
+                        local delta_start = data[i+1]
+                        local length = data[i+2]
+                        local token_type = data[i+3]
+                        
+                        if delta_line > 0 then
+                          current_line = current_line + delta_line
+                          current_col = delta_start
+                        else
+                          current_col = current_col + delta_start
+                        end
+                        
+                        if token_type == 1 then
+                          local lines = vim.api.nvim_buf_get_lines(ctx.bufnr, current_line, current_line + 1, false)
+                          if #lines > 0 then
+                            local line_text = lines[1]
+                            local token_text = line_text:sub(current_col + 1, current_col + length)
+                            if token_text then
+                              local ref_name = token_text
+                              local target_in_parens = ref_name:match("%((.-)%)")
+                              if target_in_parens then
+                                ref_name = target_in_parens
+                              else
+                                ref_name = ref_name:gsub("^%[%[", ""):gsub("%]%]$", "")
+                                local pipe_idx = ref_name:find("|")
+                                if pipe_idx then
+                                  ref_name = ref_name:sub(1, pipe_idx - 1)
+                                end
+                              end
+                              ref_name = ref_name:gsub("^mark:", "")
+                              ref_name = ref_name:gsub("^%s+", ""):gsub("%s+$", "")
+                              if codemarks.is_mark_in_db(ref_name) then
+                                data[i+3] = 0 -- Change to resolved
+                              end
+                            end
+                          end
+                        end
+                      end
+                    end
+                  end
+                  return orig_handler(err, result, ctx, config)
+                end
+              end
+              return orig_request(self, method, params, handler, bufnr)
+            end
+          end
+
           -- Enable inlay hints for markdown buffers if supported
           if vim.lsp.inlay_hint and client.server_capabilities.inlayHintProvider then
             vim.lsp.inlay_hint.enable(true, { bufnr = bufnr })
