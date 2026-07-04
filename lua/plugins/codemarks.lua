@@ -103,15 +103,15 @@ return {
       local codemarks = require("codemarks")
 
       -- Mappings in standard buffers
-      vim.keymap.set("n", "<leader>mc", codemarks.create_mark, { desc = "CodeMarks: Create mark at cursor" })
-      vim.keymap.set("n", "<leader>md", codemarks.delete_mark, { desc = "CodeMarks: Delete mark" })
-      vim.keymap.set("n", "<leader>me", codemarks.edit_mark, { desc = "CodeMarks: Edit mark metadata" })
-      vim.keymap.set("n", "<leader>fm", codemarks.search_marks, { desc = "CodeMarks: Search marks (Telescope)" })
+      vim.keymap.set("n", "<leader>mc", function() require("codemarks").create_mark() end, { desc = "CodeMarks: Create mark at cursor" })
+      vim.keymap.set("n", "<leader>md", function() require("codemarks").delete_mark() end, { desc = "CodeMarks: Delete mark" })
+      vim.keymap.set("n", "<leader>me", function() require("codemarks").edit_mark() end, { desc = "CodeMarks: Edit mark metadata" })
+      vim.keymap.set("n", "<leader>fm", function() require("codemarks").search_marks() end, { desc = "CodeMarks: Search marks (Telescope)" })
 
       -- Autocmd to handle line drift on buffer write
       vim.api.nvim_create_autocmd("BufWritePost", {
         callback = function(args)
-          codemarks.update_line_drift(args.buf)
+          require("codemarks").update_line_drift(args.buf)
         end
       })
 
