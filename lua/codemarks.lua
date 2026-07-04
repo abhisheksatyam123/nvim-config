@@ -162,10 +162,10 @@ function M.get_mark_under_cursor()
     start_idx = e + 1
   end
 
-  -- 3. Pattern: mark:([%w_%%-%%s]+)
+  -- 3. Pattern: mark:([%w_%%-%%s%%.%%/%%:]+)
   start_idx = 1
   while true do
-    local s, e, raw_name = line:find("mark:([%%w_%%-%%s]+)", start_idx)
+    local s, e, raw_name = line:find("mark:([%%w_%%-%%s%%.%%/%%:]+)", start_idx)
     if not s then break end
     if col >= s and col <= e then
       local words = {}
@@ -180,8 +180,11 @@ function M.get_mark_under_cursor()
         else
           candidate = candidate .. " " .. w
         end
+        local clean_candidate = candidate:gsub("[%%.%%,;%%?%%!]$", "")
         if M.is_mark_in_db(candidate) then
           best_match = candidate
+        elseif M.is_mark_in_db(clean_candidate) then
+          best_match = clean_candidate
         end
       end
       if best_match then
@@ -214,12 +217,12 @@ function M.create_mark()
       return
     end
     
-    local clean_name = name:match("^[%%w_%%-%%s]+$")
+    local clean_name = name:match("^[^%%[%%]%%(%%)|]+$")
     if clean_name then
       clean_name = clean_name:gsub("^%%s+", ""):gsub("%%s+$", "")
     end
     if not clean_name or clean_name == "" then
-      vim.notify("Mark name must be alphanumeric with spaces, hyphens, or underscores only", vim.log.levels.ERROR)
+      vim.notify("Mark name cannot contain brackets, parentheses, or pipe characters", vim.log.levels.ERROR)
       return
     end
 
@@ -337,12 +340,12 @@ function M.edit_mark()
       if action == "Rename" then
         vim.ui.input({ prompt = "New name for " .. mark_id .. ": ", default = mark_id }, function(new_name)
           if not new_name or new_name == "" or new_name == mark_id then return end
-          local clean_new = new_name:match("^[%%w_%%-%%s]+$")
+          local clean_new = new_name:match("^[^%%[%%]%%(%%)|]+$")
           if clean_new then
             clean_new = clean_new:gsub("^%%s+", ""):gsub("%%s+$", "")
           end
           if not clean_new or clean_new == "" then
-            vim.notify("Mark name must be alphanumeric with spaces, hyphens, or underscores only", vim.log.levels.ERROR)
+            vim.notify("Mark name cannot contain brackets, parentheses, or pipe characters", vim.log.levels.ERROR)
             return
           end
           local dup = db:select("marks", { where = { id = clean_new } })
