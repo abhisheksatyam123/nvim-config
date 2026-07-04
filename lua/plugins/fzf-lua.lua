@@ -4,6 +4,7 @@ return {
   config = function()
     local fzf = require("fzf-lua")
     fzf.setup({
+      formatter = "path.filename_first",
       files = {
         cmd = "fdfind --color=never --type f",
       },
