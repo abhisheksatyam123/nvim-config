@@ -4,9 +4,4 @@ return {
     event = "InsertEnter",
     opts = {},
   },
-  {
-    "windwp/nvim-ts-autotag",
-    event = { "BufReadPre", "BufNewFile" },
-    opts = {},
-  },
 }

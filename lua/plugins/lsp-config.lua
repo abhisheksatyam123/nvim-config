@@ -8,25 +8,6 @@ return {
       require("mason").setup()
     end,
   },
-
-  -- Mason ↔ LSP bridge (v2+)
-  {
-    "mason-org/mason-lspconfig.nvim",
-    lazy = false,
-    opts = {
-      -- Install the servers you actually use
-      ensure_installed = {
-        -- General
-        "lua_ls", "html", "cssls", "jsonls", "ts_ls",
-        -- C/C++
-        "clangd",
-        -- markdown_oxide is built locally from source; not managed by Mason
-      },
-      -- We'll enable explicitly below (to avoid double-enabling)
-      automatic_enable = false,
-    },
-  },
-
   -- Native LSP config and UI
   {
     "neovim/nvim-lspconfig",
@@ -243,7 +224,7 @@ return {
       -- clangd
       vim.lsp.config("clangd", {
         cmd = {
-          "/usr/local/bin/clangd",
+          "clangd",
           "--enable-config",
           "--background-index",
           "--background-index-priority=background",
@@ -469,10 +450,6 @@ return {
       -- Enable exactly what we configured (no duplicates)
       vim.lsp.enable({ "lua_ls", "ts_ls", "html", "cssls", "jsonls", "clangd", "markdown_oxide" })
     end,
-    dependencies = {
-      "hrsh7th/nvim-cmp",
-      "hrsh7th/cmp-nvim-lsp",
-    },
   },
 
   -- Tree-sitter: make sure Markdown parsers exist so hover/signature never crash
@@ -482,7 +459,7 @@ return {
     build = ":TSUpdate",
     opts = {
       ensure_installed = {
-        "lua", "html", "css", "json", "javascript", "typescript",
+        "html", "css", "json", "javascript", "typescript",
         "markdown", "markdown_inline",
       },
       -- Treesitter markdown + conceallevel>0 triggers conceal_line errors on

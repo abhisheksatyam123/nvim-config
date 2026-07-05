@@ -2,19 +2,27 @@ local M = {}
 
 -- SQLite database for search index
 M.db_path = vim.fn.expand("~/.codemarks.db")
+local _db = nil
 
 -- Initialize database
 function M.init_db()
+  if _db then return _db end
+
   local ok, sqlite = pcall(require, "sqlite")
   if not ok then
     vim.notify("sqlite.lua not available", vim.log.levels.WARN)
     return nil
   end
   
-  local db = sqlite.new(M.db_path, { keep_open = true })
+  local ok_new, db = pcall(sqlite.new, M.db_path, { keep_open = true })
+  if not ok_new then
+    vim.notify("sqlite.lua: " .. tostring(db), vim.log.levels.ERROR)
+    return nil
+  end
+  _db = db
   
   -- Create marks table if not exists
-  db:eval([[
+  _db:eval([[
     CREATE TABLE IF NOT EXISTS marks (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -27,7 +35,7 @@ function M.init_db()
     )
   ]])
   
-  return db
+  return _db
 end
 
 -- Find files in the notes vault referencing a code mark name
@@ -437,6 +445,7 @@ function M.goto_mark(name)
 end
 
 -- Search marks via Telescope
+-- Search marks via Fzf-Lua
 function M.search_marks()
   local db = M.init_db()
   if not db then
@@ -450,47 +459,34 @@ function M.search_marks()
     return
   end
   
-  local pickers = require("telescope.pickers")
-  local finders = require("telescope.finders")
-  local conf = require("telescope.config").values
-  local entry_display = require("telescope.pickers.entry_display")
-  
-  local displayer = entry_display.create({
-    separator = " ▏ ",
-    items = {
-      { width = 20 },
-      { width = 45 },
-      { remaining = true },
-    }
-  })
-  
-  local function make_display(entry)
-    local rel_path = vim.fn.fnamemodify(entry.value.file, ":~:.")
-    return displayer({
-      { entry.value.name, "TelescopeResultsIdentifier" },
-      { rel_path .. ":" .. entry.value.line, "TelescopeResultsLineNr" },
-      { entry.value.code or "", "TelescopeResultsComment" },
-    })
+  local fzf = require("fzf-lua")
+  local results = {}
+  for _, entry in ipairs(marks) do
+    local rel_path = vim.fn.fnamemodify(entry.file, ":~:.")
+    local display_str = string.format("%s ▏ %s:%d:%d ▏ %s", entry.name, rel_path, entry.line, entry.col or 1, entry.code or "")
+    table.insert(results, display_str)
   end
   
-  pickers.new({}, {
-    prompt_title = "Code Marks",
-    finder = finders.new_table({
-      results = marks,
-      entry_maker = function(entry)
-        return {
-          value = entry,
-          display = make_display,
-          ordinal = entry.name .. " " .. entry.file .. " " .. (entry.code or ""),
-          filename = entry.file,
-          lnum = entry.line,
-          col = entry.col,
-        }
-      end,
-    }),
-    sorter = conf.generic_sorter({}),
-    previewer = conf.file_previewer({}),
-  }):find()
+  fzf.fzf_exec(results, {
+    prompt = "Code Marks> ",
+    actions = {
+      ["default"] = function(selected)
+        if not selected or #selected == 0 then return end
+        local sel = selected[1]
+        local parts = vim.split(sel, " ▏ ", { plain = true })
+        if #parts >= 2 then
+          local loc = parts[2]
+          local file, line, col = loc:match("^(.+):(%d+):(%d+)$")
+          if file and line then
+            local abs_path = vim.fn.fnamemodify(file, ":p")
+            vim.cmd("edit " .. vim.fn.fnameescape(abs_path))
+            vim.api.nvim_win_set_cursor(0, { tonumber(line), tonumber(col) - 1 })
+            vim.cmd("normal! zz")
+          end
+        end
+      end
+    }
+  })
 end
 
 -- Update line drift on buffer write

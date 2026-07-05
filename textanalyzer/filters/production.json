@@ -1,0 +1,1 @@
+{"name": "production", "created_at": "2026-07-05T18:55:24", "filters": [{"case_sensitive": false, "pattern": "ERROR", "invert": false, "name": "Errors", "priority": 0, "enabled": true, "type": "regex", "color": "Red"}]}
