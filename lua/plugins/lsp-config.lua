@@ -256,7 +256,7 @@ return {
       -- To update: cd /home/abhi/qprojects/markdown-oxide && cargo build --release
       -- Then :LspRestart in nvim.
       vim.lsp.config("markdown_oxide", {
-        cmd = { "/home/abhi/qprojects/markdown-oxide/target/release/markdown-oxide" },
+        cmd = { "/home/abhi/project/markdown-oxide/target/release/markdown-oxide" },
         filetypes = { "markdown" },
         -- Extend capabilities: enable willSaveWaitUntil and watched-file dynamic registration
         capabilities = vim.tbl_deep_extend("force", capabilities, {
