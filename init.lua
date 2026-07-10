@@ -40,9 +40,6 @@ vim.opt.shiftwidth = 4
 vim.opt.expandtab = true
 vim.opt.swapfile = false
 vim.opt.termguicolors = true
--- conceallevel: keep at 0 globally to avoid treesitter conceal_line errors on
--- non-markdown buffers. Vault markdown buffers set local conceallevel=2 in
--- plugins/obsidian.lua so Obsidian UI extmarks can render checkboxes/icons.
 vim.opt.conceallevel = 0
 vim.wo.number = true
 vim.opt.timeoutlen = 1000
@@ -53,7 +50,6 @@ vim.o.winborder = "double"
 
 
 -- Treesitter occasionally throws extmark range errors on terminal buffers.
--- RelationWindow uses :termopen(), so keep TS disabled for terminal windows.
 vim.api.nvim_create_autocmd("TermOpen", {
   callback = function(args)
     -- Keep relation/terminal buffers out of code LSP hint pipelines.
@@ -102,5 +98,3 @@ require("lazy").setup({
   },
 })
 
--- RelationWindow commands and mappings are loaded from:
---   ~/.config/nvim/plugin/relation_window.lua
