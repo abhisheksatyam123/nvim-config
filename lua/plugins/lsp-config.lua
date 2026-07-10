@@ -235,6 +235,7 @@ return {
           "--completion-style=detailed",
           "--function-arg-placeholders",
           "--fallback-style=llvm",
+          "--query-driver=/home/abhi/envs/toolchain/bin/g++,/home/abhi/envs/toolchain/bin/gcc",
         },
         root_markers = { "compile_commands.json" },
         init_options = {
