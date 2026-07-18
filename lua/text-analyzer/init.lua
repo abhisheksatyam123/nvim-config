@@ -551,16 +551,21 @@ function M.add_filter(bufnr, filter_opts)
   -- Auto-enable on first filter
   if not st.enabled then st.enabled = true end
 
-  -- Run rg async; refresh UI when done
-  M.match_filter(filter, bufnr, function()
-    vim.schedule(function() _refresh(bufnr) end)
-  end)
-
-  -- For large files, kick off the full result rebuild (it will cancel/restart)
   if M.is_large_file(bufnr) then
+    -- Large file: populate_large_file_results runs rg for ALL filters;
+    -- no need to call match_filter separately.
     M.populate_large_file_results(bufnr)
   else
-    M.enable_folds(bufnr)
+    -- Small file: run rg async for just this filter, then refresh.
+    M.match_filter(filter, bufnr, function()
+      vim.schedule(function()
+        M.enable_folds(bufnr)          -- activate folds once cache is ready
+        M.recompute_visibility(bufnr)
+        M.apply_highlights(bufnr)
+        vim.cmd("redraw!")
+        get_ui().refresh_panel(bufnr)
+      end)
+    end)
   end
 
   return filter
@@ -775,7 +780,9 @@ function M._register_autocmds()
   local group    = vim.api.nvim_create_augroup("text-analyzer", { clear = true })
   local patterns = vim.tbl_map(function(ft) return "*." .. ft end, M.config.enable_filetypes)
 
-  -- BufReadCmd: intercept file open before Neovim reads it
+  -- BufReadCmd: intercept file open before Neovim reads it.
+  -- NOTE: BufReadCmd completely replaces the built-in read, so BufRead/BufReadPost
+  -- will NOT fire automatically. We call _auto_load_filters here ourselves.
   vim.api.nvim_create_autocmd("BufReadCmd", {
     group   = group,
     pattern = patterns,
@@ -787,7 +794,6 @@ function M._register_autocmds()
 
       if size >= 0 and size < M.config.large_file_threshold then
         -- ── Small file: read normally ──────────────────────────────
-        -- 0read inserts at the very start (no blank-line issue)
         vim.cmd("silent keepalt 0read " .. vim.fn.fnameescape(filepath))
         vim.bo[args.buf].modified = false
       else
@@ -809,17 +815,12 @@ function M._register_autocmds()
         })
         vim.bo[args.buf].modifiable = false
       end
-    end,
-  })
 
-  -- BufRead: trigger auto-load filter sets
-  vim.api.nvim_create_autocmd("BufRead", {
-    group   = group,
-    pattern = patterns,
-    callback = function(args)
+      -- BufRead never fires after BufReadCmd, so trigger auto-load here.
       vim.schedule(function()
-        if not vim.api.nvim_buf_is_valid(args.buf) then return end
-        M._auto_load_filters(args.buf, vim.api.nvim_buf_get_name(args.buf))
+        if vim.api.nvim_buf_is_valid(args.buf) then
+          M._auto_load_filters(args.buf, filepath)
+        end
       end)
     end,
   })
