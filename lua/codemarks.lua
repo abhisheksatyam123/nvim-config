@@ -4,6 +4,21 @@ local M = {}
 M.db_path = vim.fn.expand("~/.codemarks.db")
 local _db = nil
 
+-- Extmark namespace for gutter signs + virtual text
+M.ns = vim.api.nvim_create_namespace("codemarks")
+
+-- Define highlight groups once (idempotent)
+local function setup_highlights()
+  vim.api.nvim_set_hl(0, "CodeMarkSign",     { fg = "#f5a97f", bold = true })
+  vim.api.nvim_set_hl(0, "CodeMarkVirtText", { fg = "#6e738d", italic = true })
+end
+setup_highlights()
+-- Re-apply after colorscheme changes
+vim.api.nvim_create_autocmd("ColorScheme", {
+  callback = setup_highlights,
+  desc = "Re-apply CodeMark highlight groups after colorscheme change",
+})
+
 -- Initialize database
 function M.init_db()
   if _db then return _db end
@@ -13,14 +28,14 @@ function M.init_db()
     vim.notify("sqlite.lua not available", vim.log.levels.WARN)
     return nil
   end
-  
+
   local ok_new, db = pcall(sqlite.new, M.db_path, { keep_open = true })
   if not ok_new then
     vim.notify("sqlite.lua: " .. tostring(db), vim.log.levels.ERROR)
     return nil
   end
   _db = db
-  
+
   -- Create marks table if not exists
   _db:eval([[
     CREATE TABLE IF NOT EXISTS marks (
@@ -34,24 +49,68 @@ function M.init_db()
       created_at TEXT DEFAULT (datetime('now'))
     )
   ]])
-  
+
   return _db
 end
+
+-- ─────────────────────────────────────────────────────────────
+--  Gutter signs + virtual text
+-- ─────────────────────────────────────────────────────────────
+
+-- Render extmarks for all marks in a given buffer
+function M.refresh_signs(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then return end
+  local filepath = vim.api.nvim_buf_get_name(bufnr)
+  if filepath == "" then return end
+
+  -- Clear previous extmarks for this buffer
+  vim.api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
+
+  local db = M.init_db()
+  if not db then return end
+
+  local marks = db:select("marks", { where = { file = filepath } })
+  if not marks or #marks == 0 then return end
+
+  local num_lines = vim.api.nvim_buf_line_count(bufnr)
+  for _, mark in ipairs(marks) do
+    local line0 = mark.line - 1 -- convert to 0-indexed
+    if line0 >= 0 and line0 < num_lines then
+      vim.api.nvim_buf_set_extmark(bufnr, M.ns, line0, 0, {
+        sign_text     = "◆",
+        sign_hl_group = "CodeMarkSign",
+        virt_text     = { { "  ← " .. mark.name, "CodeMarkVirtText" } },
+        virt_text_pos = "eol",
+        priority      = 10,
+      })
+    end
+  end
+end
+
+-- Refresh signs in all currently loaded buffers (e.g. after a delete)
+local function refresh_all_bufs()
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) then
+      M.refresh_signs(bufnr)
+    end
+  end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  Notes-vault reference helpers
+-- ─────────────────────────────────────────────────────────────
 
 -- Find files in the notes vault referencing a code mark name
 function M.find_references(name)
   if vim.fn.executable("rg") == 0 then return {} end
-  
+
   local notes_dir = "/home/abhi/notes"
-  -- Search for [[name]] or mark:name
-  local pattern = string.format([=[\bmark:%s\b|\[\[%s\]\]]=], name, name)
-  local cmd = { "rg", "--files-with-matches", vim.fn.shellescape(pattern), vim.fn.shellescape(notes_dir) }
-  
-  local handle = io.popen(table.concat(cmd, " "))
-  if not handle then return {} end
-  local result = handle:read("*a")
-  handle:close()
-  
+  -- Pass args as a list → no shell, no double-escaping
+  local pattern = string.format([[\\bmark:%s\\b|\\[\\[%s\\]\\]]], name, name)
+  local result = vim.fn.system({ "rg", "--files-with-matches", pattern, notes_dir })
+  if vim.v.shell_error ~= 0 and result == "" then return {} end
+
   local files = {}
   for file in result:gmatch("[^\r\n]+") do
     table.insert(files, file)
@@ -79,12 +138,9 @@ function M.rename_references(old_name, new_name)
         if f then
           local content = f:read("*a")
           f:close()
-          -- Replace mark:old_name with mark:new_name
-          -- Replace [[old_name]] with [[new_name]]
           local new_content, replacements1 = content:gsub("mark:" .. escaped_old, "mark:" .. new_name)
           local replacements2
           new_content, replacements2 = new_content:gsub("%[%[" .. escaped_old .. "%]%]", "[[" .. new_name .. "]]")
-          
           if replacements1 > 0 or replacements2 > 0 then
             local wf = io.open(file, "w")
             if wf then
@@ -102,14 +158,16 @@ function M.rename_references(old_name, new_name)
   end)
 end
 
+-- ─────────────────────────────────────────────────────────────
+--  Core DB helpers
+-- ─────────────────────────────────────────────────────────────
+
 -- Check if a mark exists in database
 function M.is_mark_in_db(name)
   local db = M.init_db()
   if not db then return false end
   local res = db:select("marks", { where = { id = name } })
-  if res and #res > 0 then
-    return true
-  end
+  if res and #res > 0 then return true end
   res = db:select("marks", { where = { name = name } })
   return res and #res > 0
 end
@@ -128,29 +186,27 @@ local function get_word_at_col(line, col)
   return nil
 end
 
--- Extract mark name under cursor
+-- Extract mark name under cursor (supports mark:name, [[name]], [text](mark:name), plain word)
 function M.get_mark_under_cursor()
   local line = vim.api.nvim_get_current_line()
   local col = vim.api.nvim_win_get_cursor(0)[2] + 1
 
-  -- 1. Pattern: [text](url) where url is mark:<name>
+  -- 1. [text](mark:<name>)
   local start_idx = 1
   while true do
-    local s, e, text, url = line:find("%[([^%]]+)%]%(([^%)]+)%)", start_idx)
+    local s, e, _, url = line:find("%[([^%]]+)%]%(([^%)]+)%)", start_idx)
     if not s then break end
     if col >= s and col <= e then
       local name = url:match("^mark:(.+)$")
       if name then
         name = name:gsub("^%s+", ""):gsub("%s+$", "")
-        if M.is_mark_in_db(name) then
-          return name
-        end
+        if M.is_mark_in_db(name) then return name end
       end
     end
     start_idx = e + 1
   end
 
-  -- 2. Pattern: [[(.-)]] (wikilink style, allows any chars inside brackets)
+  -- 2. [[name]] wikilink
   start_idx = 1
   while true do
     local s, e, raw_name = line:find("%[%[([^%]]+)%]%]", start_idx)
@@ -159,76 +215,59 @@ function M.get_mark_under_cursor()
       local name = raw_name:gsub("^mark:", "")
       name = name:gsub("^%s+", ""):gsub("%s+$", "")
       local pipe_idx = name:find("|")
-      if pipe_idx then
-        name = name:sub(1, pipe_idx - 1)
-      end
+      if pipe_idx then name = name:sub(1, pipe_idx - 1) end
       name = name:gsub("^%s+", ""):gsub("%s+$", "")
-      if M.is_mark_in_db(name) then
-        return name
-      end
+      if M.is_mark_in_db(name) then return name end
     end
     start_idx = e + 1
   end
 
-  -- 3. Pattern: mark:([%w_%%-%%s%%.%%/%%:]+)
+  -- 3. mark:<name>
   start_idx = 1
   while true do
     local s, e, raw_name = line:find("mark:([%w_%-%s%.%/%:]+)", start_idx)
     if not s then break end
     if col >= s and col <= e then
       local words = {}
-      for word in raw_name:gmatch("%S+") do
-        table.insert(words, word)
-      end
+      for word in raw_name:gmatch("%S+") do table.insert(words, word) end
       local candidate = ""
       local best_match = nil
       for i, w in ipairs(words) do
-        if i == 1 then
-          candidate = w
-        else
-          candidate = candidate .. " " .. w
-        end
-        local clean_candidate = candidate:gsub("[%.,;%?!]$", "")
-        if M.is_mark_in_db(candidate) then
-          best_match = candidate
-        elseif M.is_mark_in_db(clean_candidate) then
-          best_match = clean_candidate
-        end
+        candidate = (i == 1) and w or (candidate .. " " .. w)
+        local clean = candidate:gsub("[%.,;%?!]$", "")
+        if M.is_mark_in_db(candidate) then best_match = candidate
+        elseif M.is_mark_in_db(clean) then best_match = clean end
       end
-      if best_match then
-        return best_match
-      end
+      if best_match then return best_match end
     end
     start_idx = e + 1
   end
 
-  -- 4. Fallback: current word under cursor if it exists in DB
+  -- 4. Fallback: plain word under cursor
   local word = get_word_at_col(line, col)
-  if word and word ~= "" then
-    if M.is_mark_in_db(word) then
-      return word
-    end
-  end
+  if word and word ~= "" and M.is_mark_in_db(word) then return word end
 
   return nil
 end
+
+-- ─────────────────────────────────────────────────────────────
+--  CRUD operations
+-- ─────────────────────────────────────────────────────────────
 
 -- Create a code mark for the current cursor position
 function M.create_mark()
   vim.ui.input({ prompt = "Enter Code Mark Name: " }, function(name)
     if not name or name == "" then return end
-    
-    local bufnr = vim.api.nvim_get_current_buf()
+
+    local bufnr   = vim.api.nvim_get_current_buf()
     local filepath = vim.api.nvim_buf_get_name(bufnr)
     if filepath == "" then
       vim.notify("Buffer has no file path", vim.log.levels.ERROR)
       return
     end
-    
+
     local clean_name = name:match("^[^%[%]%(%)|]+$")
-    if clean_name then
-      clean_name = clean_name:gsub("^%s+", ""):gsub("%s+$", "")
-    end
+    if clean_name then clean_name = clean_name:gsub("^%s+", ""):gsub("%s+$", "") end
     if not clean_name or clean_name == "" then
       vim.notify("Mark name cannot contain brackets, parentheses, or pipe characters", vim.log.levels.ERROR)
       return
@@ -240,32 +279,46 @@ function M.create_mark()
       return
     end
 
-    -- Check if mark already exists
     local existing = db:select("marks", { where = { id = clean_name } })
     if existing and #existing > 0 then
       vim.notify("Mark '" .. clean_name .. "' already exists!", vim.log.levels.WARN)
       return
     end
 
-    local lnum = vim.api.nvim_win_get_cursor(0)[1]
-    local col = vim.api.nvim_win_get_cursor(0)[2] + 1
+    local lnum      = vim.api.nvim_win_get_cursor(0)[1]
+    local col       = vim.api.nvim_win_get_cursor(0)[2] + 1
     local line_text = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
 
-    -- Insert into database
     db:insert("marks", {
-      id = clean_name,
+      id   = clean_name,
       name = clean_name,
       file = filepath,
       line = lnum,
-      col = col,
+      col  = col,
       code = line_text,
     })
 
+    -- Immediately show the sign in the current buffer
+    M.refresh_signs(bufnr)
     vim.notify("Created code mark: " .. clean_name, vim.log.levels.INFO)
   end)
 end
 
--- Delete a code mark
+-- Internal delete (no UI prompt) — used by picker and delete_mark
+local function _do_delete(db, mark_id)
+  db:delete("marks", { id = mark_id })
+  refresh_all_bufs()
+  vim.notify("Deleted code mark: " .. mark_id, vim.log.levels.INFO)
+  -- Warn if still referenced in notes
+  local files = M.find_references(mark_id)
+  if #files > 0 then
+    local names = {}
+    for _, f in ipairs(files) do table.insert(names, vim.fn.fnamemodify(f, ":t")) end
+    vim.notify(string.format("Note: '%s' is still referenced in: %s", mark_id, table.concat(names, ", ")), vim.log.levels.WARN)
+  end
+end
+
+-- Delete a code mark (detects under cursor, otherwise shows picker)
 function M.delete_mark(name)
   local db = M.init_db()
   if not db then
@@ -273,23 +326,8 @@ function M.delete_mark(name)
     return
   end
 
-  local function do_delete(mark_id)
-    db:delete("marks", { id = mark_id })
-    vim.notify("Deleted code mark: " .. mark_id, vim.log.levels.INFO)
-    
-    -- Warn user if the mark is still referenced in note files
-    local files = M.find_references(mark_id)
-    if #files > 0 then
-      local file_list = {}
-      for _, f in ipairs(files) do
-        table.insert(file_list, vim.fn.fnamemodify(f, ":t"))
-      end
-      vim.notify(string.format("Note: Deleted mark '%s' is still referenced in: %s", mark_id, table.concat(file_list, ", ")), vim.log.levels.WARN)
-    end
-  end
-
   if name and name ~= "" then
-    do_delete(name)
+    _do_delete(db, name)
     return
   end
 
@@ -298,9 +336,7 @@ function M.delete_mark(name)
     vim.ui.select({ "Yes", "No" }, {
       prompt = "Delete code mark '" .. detected .. "'?",
     }, function(choice)
-      if choice == "Yes" then
-        do_delete(detected)
-      end
+      if choice == "Yes" then _do_delete(db, detected) end
     end)
     return
   end
@@ -312,16 +348,12 @@ function M.delete_mark(name)
   end
 
   local mark_names = {}
-  for _, m in ipairs(marks) do
-    table.insert(mark_names, m.name)
-  end
+  for _, m in ipairs(marks) do table.insert(mark_names, m.name) end
 
   vim.ui.select(mark_names, {
     prompt = "Select code mark to delete:",
   }, function(choice)
-    if choice then
-      do_delete(choice)
-    end
+    if choice then _do_delete(db, choice) end
   end)
 end
 
@@ -349,9 +381,7 @@ function M.edit_mark()
         vim.ui.input({ prompt = "New name for " .. mark_id .. ": ", default = mark_id }, function(new_name)
           if not new_name or new_name == "" or new_name == mark_id then return end
           local clean_new = new_name:match("^[^%[%]%(%)|]+$")
-          if clean_new then
-            clean_new = clean_new:gsub("^%s+", ""):gsub("%s+$", "")
-          end
+          if clean_new then clean_new = clean_new:gsub("^%s+", ""):gsub("%s+$", "") end
           if not clean_new or clean_new == "" then
             vim.notify("Mark name cannot contain brackets, parentheses, or pipe characters", vim.log.levels.ERROR)
             return
@@ -363,11 +393,11 @@ function M.edit_mark()
           end
           db:update("marks", {
             where = { id = mark_id },
-            set = { id = clean_new, name = clean_new }
+            set   = { id = clean_new, name = clean_new },
           })
+          -- Refresh signs so new name shows in virtual text
+          refresh_all_bufs()
           vim.notify("Renamed CodeMark '" .. mark_id .. "' to '" .. clean_new .. "'", vim.log.levels.INFO)
-          
-          -- Ask to rename references in markdown notes
           M.rename_references(mark_id, clean_new)
         end)
       elseif action == "Edit Description" then
@@ -375,7 +405,7 @@ function M.edit_mark()
           if not new_desc then return end
           db:update("marks", {
             where = { id = mark_id },
-            set = { content = new_desc }
+            set   = { content = new_desc },
           })
           vim.notify("Updated description for CodeMark '" .. mark_id .. "'", vim.log.levels.INFO)
         end)
@@ -395,16 +425,12 @@ function M.edit_mark()
   end
 
   local mark_names = {}
-  for _, m in ipairs(marks) do
-    table.insert(mark_names, m.name)
-  end
+  for _, m in ipairs(marks) do table.insert(mark_names, m.name) end
 
   vim.ui.select(mark_names, {
     prompt = "Select code mark to edit:",
   }, function(choice)
-    if choice then
-      start_edit(choice)
-    end
+    if choice then start_edit(choice) end
   end)
 end
 
@@ -422,20 +448,17 @@ function M.goto_mark(name)
     local mark = res[1]
     local file = mark.file
     local line = mark.line
-    local col = mark.col or 1
+    local col  = mark.col or 1
 
     if vim.fn.filereadable(file) == 0 then
       vim.notify("File not readable: " .. file, vim.log.levels.ERROR)
       return
     end
 
-    local target_buf = vim.fn.bufadd(file)
-    vim.fn.bufload(target_buf)
-    vim.api.nvim_set_current_buf(target_buf)
+    -- edit fires BufReadPost → LSP/treesitter attach properly
+    vim.cmd("edit " .. vim.fn.fnameescape(file))
     local num_lines = vim.api.nvim_buf_line_count(0)
-    if line > num_lines then
-      line = num_lines
-    end
+    line = math.min(line, num_lines)
     vim.api.nvim_win_set_cursor(0, { line, col - 1 })
     vim.cmd("normal! zz")
     vim.notify("Jumped to CodeMark '" .. mark.name .. "' at " .. vim.fn.fnamemodify(file, ":t") .. ":" .. line, vim.log.levels.INFO)
@@ -444,96 +467,134 @@ function M.goto_mark(name)
   end
 end
 
--- Search marks via Telescope
--- Search marks via Fzf-Lua
+-- ─────────────────────────────────────────────────────────────
+--  \fm — fzf-lua picker with jump + CTRL-D delete
+-- ─────────────────────────────────────────────────────────────
+
 function M.search_marks()
   local db = M.init_db()
   if not db then
     vim.notify("Database not available", vim.log.levels.ERROR)
     return
   end
-  
+
   local marks = db:select("marks")
   if not marks or #marks == 0 then
     vim.notify("No code marks found", vim.log.levels.WARN)
     return
   end
-  
+
   local fzf = require("fzf-lua")
-  local results = {}
+
+  -- Build display list and a lookup table keyed by display string
+  local results   = {}
+  local info_map  = {} -- display_str → { name, file, line, col }
   for _, entry in ipairs(marks) do
     local rel_path = vim.fn.fnamemodify(entry.file, ":~:.")
-    local display_str = string.format("%s ▏ %s:%d:%d ▏ %s", entry.name, rel_path, entry.line, entry.col or 1, entry.code or "")
-    table.insert(results, display_str)
+    local display  = string.format(
+      "%-30s │ %s:%d  %s",
+      entry.name,
+      rel_path,
+      entry.line,
+      entry.code or ""
+    )
+    table.insert(results, display)
+    info_map[display] = {
+      name = entry.name,
+      file = entry.file,
+      line = entry.line,
+      col  = entry.col or 1,
+    }
   end
-  
+
+  local function jump_to(info)
+    vim.cmd("edit " .. vim.fn.fnameescape(info.file))
+    local num_lines = vim.api.nvim_buf_line_count(0)
+    local line = math.min(info.line, num_lines)
+    vim.api.nvim_win_set_cursor(0, { line, info.col - 1 })
+    vim.cmd("normal! zz")
+  end
+
   fzf.fzf_exec(results, {
-    prompt = "Code Marks> ",
+    prompt = "CodeMarks❯ ",
+    fzf_opts = {
+      ["--multi"]  = true,
+      ["--header"] = "ENTER: jump  │  CTRL-D: delete",
+    },
     actions = {
+      -- Default: jump to the selected mark
       ["default"] = function(selected)
         if not selected or #selected == 0 then return end
-        local sel = selected[1]
-        local parts = vim.split(sel, " ▏ ", { plain = true })
-        if #parts >= 2 then
-          local loc = parts[2]
-          local file, line, col = loc:match("^(.+):(%d+):(%d+)$")
-          if file and line then
-            local abs_path = vim.fn.fnamemodify(file, ":p")
-            vim.cmd("edit " .. vim.fn.fnameescape(abs_path))
-            vim.api.nvim_win_set_cursor(0, { tonumber(line), tonumber(col) - 1 })
-            vim.cmd("normal! zz")
+        local info = info_map[selected[1]]
+        if info then jump_to(info) end
+      end,
+
+      -- CTRL-D: delete selected marks (supports multi-select), then reopen
+      ["ctrl-d"] = function(selected)
+        if not selected or #selected == 0 then return end
+        local deleted = {}
+        for _, sel in ipairs(selected) do
+          local info = info_map[sel]
+          if info then
+            _do_delete(db, info.name)
+            table.insert(deleted, info.name)
           end
         end
-      end
-    }
+        if #deleted > 0 then
+          -- Brief delay so the notify shows before picker reopens
+          vim.defer_fn(function()
+            M.search_marks()
+          end, 50)
+        end
+      end,
+    },
   })
 end
 
--- Update line drift on buffer write
+-- ─────────────────────────────────────────────────────────────
+--  Line-drift tracking on save
+-- ─────────────────────────────────────────────────────────────
+
 function M.update_line_drift(bufnr)
   local filepath = vim.api.nvim_buf_get_name(bufnr)
   if filepath == "" then return end
-  
+
   local db = M.init_db()
   if not db then return end
-  
+
   local marks = db:select("marks", { where = { file = filepath } })
   if not marks or #marks == 0 then return end
-  
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+  local lines    = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local num_lines = #lines
-  
+  local drifted  = false
+
   for _, mark in ipairs(marks) do
     local orig_line = mark.line
     local orig_code = mark.code
-    
     if orig_code and orig_code ~= "" then
-      if orig_line <= num_lines and lines[orig_line] == orig_code then
-        -- No drift
-      else
-        local best_line = nil
-        local min_dist = math.huge
-        
+      if not (orig_line <= num_lines and lines[orig_line] == orig_code) then
+        local best_line, min_dist = nil, math.huge
         for idx, line_text in ipairs(lines) do
           if line_text == orig_code then
             local dist = math.abs(idx - orig_line)
-            if dist < min_dist then
-              min_dist = dist
-              best_line = idx
-            end
+            if dist < min_dist then min_dist = dist; best_line = idx end
           end
         end
-        
         if best_line then
           db:update("marks", {
             where = { id = mark.id },
-            set = { line = best_line }
+            set   = { line = best_line },
           })
-          vim.notify(string.format("CodeMark '%s' drifted from line %d to %d", mark.name, orig_line, best_line), vim.log.levels.INFO)
+          vim.notify(string.format("CodeMark '%s' drifted: line %d → %d", mark.name, orig_line, best_line), vim.log.levels.INFO)
+          drifted = true
         end
       end
     end
   end
+
+  -- Redraw signs if any line numbers changed
+  if drifted then M.refresh_signs(bufnr) end
 end
 
 return M

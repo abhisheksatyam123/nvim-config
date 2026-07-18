@@ -14,18 +14,28 @@ return {
       -- 1. Setup Codemarks
       local ok_cm, codemarks = pcall(require, "codemarks")
       if ok_cm then
-        vim.keymap.set("n", "<leader>mc", function() codemarks.create_mark() end, { desc = "CodeMarks: Create mark at cursor" })
-        vim.keymap.set("n", "<leader>md", function() codemarks.delete_mark() end, { desc = "CodeMarks: Delete mark" })
-        vim.keymap.set("n", "<leader>me", function() codemarks.edit_mark() end, { desc = "CodeMarks: Edit mark metadata" })
-        vim.keymap.set("n", "<leader>fm", function() codemarks.search_marks() end, { desc = "CodeMarks: Search marks (Fzf-Lua)" })
+        vim.keymap.set("n", "<leader>mc", function() codemarks.create_mark() end,  { desc = "CodeMarks: Create mark at cursor" })
+        vim.keymap.set("n", "<leader>md", function() codemarks.delete_mark() end,  { desc = "CodeMarks: Delete mark" })
+        vim.keymap.set("n", "<leader>me", function() codemarks.edit_mark() end,    { desc = "CodeMarks: Edit mark metadata" })
+        vim.keymap.set("n", "<leader>fm", function() codemarks.search_marks() end, { desc = "CodeMarks: Search/jump/delete marks (Fzf-Lua)" })
 
+        -- Refresh gutter signs whenever a file is loaded into a buffer
+        vim.api.nvim_create_autocmd({ "BufReadPost", "BufEnter" }, {
+          callback = function(args)
+            codemarks.refresh_signs(args.buf)
+          end,
+          desc = "CodeMarks: render gutter signs for marks in this file",
+        })
+
+        -- Track line drift and refresh signs on every save
         vim.api.nvim_create_autocmd("BufWritePost", {
           callback = function(args)
             codemarks.update_line_drift(args.buf)
-          end
+          end,
+          desc = "CodeMarks: update line numbers if code drifted",
         })
       else
-        vim.notify("TextAnalyzer: failed to load codemarks module", vim.log.levels.ERROR)
+        vim.notify("CodeMarks: failed to load codemarks module", vim.log.levels.ERROR)
       end
 
       -- 2. Setup TextAnalyzer

@@ -14,6 +14,7 @@ description: Notes about plugins
   - [Window / Pane Management](#window-pane-management)
 - [🎨 Colorscheme & UI](#colorscheme-ui)
   - [Catppuccin (`lua/plugins/catppuccin.lua`)](#catppuccin-luapluginscatppuccinlua)
+  - [InterestingWords (`lua/plugins/interestingwords.lua`)](#interestingwords-luapluginsinterestingwordslua)
 - [🔍 Navigation & Search](#navigation-search)
   - [Fzf-Lua (`lua/plugins/fzf-lua.lua`)](#fzf-lua-luapluginsfzf-lualua)
   - [Harpoon 2 (`lua/plugins/harpoon.lua`)](#harpoon-2-luapluginsharpoonlua)
@@ -73,6 +74,18 @@ All window commands are prefixed by `\tw` (tab window prefix).
 ### Catppuccin (`lua/plugins/catppuccin.lua`)
 * **Purpose**: Soothing high-contrast colorscheme configured with custom overrides for float surfaces (hover, diagnostics, signature help).
 * **Shortcuts**: None (colorscheme is automatically loaded on startup).
+
+### InterestingWords (`lua/plugins/interestingwords.lua`)
+* **Purpose**: Highlights the word under the cursor (cycling through 42 distinct colors) and lets you navigate between highlighted words.
+* **Config**: `leisiji/interestingwords.nvim`. Colors set via `vim.g.interestingwords_colors` (42 colors); commands provided by the plugin's `Interestingwords` user command. Lazy-loaded at startup (`VeryLazy`).
+* **Shortcuts**:
+
+| Shortcut | Description |
+|---|---|
+| `\k` | Toggle highlight on the word under the cursor |
+| `\K` | Clear all InterestingWords highlights |
+| `n` | Navigate to next highlighted word |
+| `N` | Navigate to previous highlighted word |
 
 ---
 
