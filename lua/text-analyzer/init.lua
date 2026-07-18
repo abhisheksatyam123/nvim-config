@@ -30,6 +30,8 @@ M.config = {
   enable_filetypes     = { "log", "txt" },
   lighten_buffers      = true,
   large_file_threshold = 50 * 1024 * 1024,  -- 50 MB; set to 0 to always use large-file mode
+  context_lines        = 25,                 -- ±N lines loaded around a match (never the whole file)
+  max_results          = 10000,              -- per-filter cap in large-file mode
 }
 
 -- ── Buffer Lightening ────────────────────────────────────────────
@@ -85,31 +87,47 @@ function M.state(bufnr)
       excluded         = {},   -- line_num → true  (exclusion-only mode)
       has_include      = false,
       ns_id            = vim.api.nvim_create_namespace("text-analyzer-" .. bufnr),
-      saved_foldmethod = nil,
-      saved_foldtext   = nil,
+      saved_folds      = nil,  -- full window fold snapshot
       -- large-file results
-      results          = {},   -- array of { line_num, filter, content }
+      results          = {},   -- array of { line_num, byte, filter, content }
       line_map         = {},   -- buf_line (1-indexed) → original file line_num
+      byte_map         = {},   -- buf_line (1-indexed) → byte offset of match
+      truncated        = false,
       search_jobs      = {},   -- active jobstart ids (for cancellation)
+      match_gen        = 0,    -- generation token; stale job callbacks ignored
+      empty_match      = false,-- include filters matched nothing (view not restricted)
+      last_empty_notify = 0,   -- throttle empty-match notifications
     }
   end
   return buf_states[bufnr]
 end
 
-function M.clear_state(bufnr)
+--- Stop all in-flight rg jobs for a buffer.
+function M.cancel_search_jobs(bufnr)
   local st = buf_states[bufnr]
-  if st then
-    for _, jid in ipairs(st.search_jobs or {}) do
-      pcall(vim.fn.jobstop, jid)
-    end
+  if not st then return end
+  for _, jid in ipairs(st.search_jobs or {}) do
+    pcall(vim.fn.jobstop, jid)
   end
+  st.search_jobs = {}
+end
+
+function M.clear_state(bufnr)
+  M.cancel_search_jobs(bufnr)
   buf_states[bufnr] = nil
 end
 
 -- ── rg-based Async Matching ────────────────────────────────────────
 
-local function filter_to_rg_args(filter, filepath)
-  local args = { "rg", "--line-number", "--no-heading", "--color=never" }
+--- Build rg argv. opts: { byte_offset=bool, max_count=number }
+local function filter_to_rg_args(filter, filepath, opts)
+  opts = opts or {}
+  local args = { "rg", "--line-number", "--no-heading", "--color=never", "--max-columns", "2000" }
+  if opts.byte_offset then table.insert(args, "--byte-offset") end
+  if opts.max_count and opts.max_count > 0 then
+    table.insert(args, "--max-count")
+    table.insert(args, tostring(opts.max_count))
+  end
   if not filter.case_sensitive then table.insert(args, "--ignore-case") end
   if filter.type == "literal"  then table.insert(args, "--fixed-strings") end
   table.insert(args, "--")
@@ -118,36 +136,62 @@ local function filter_to_rg_args(filter, filepath)
   return args
 end
 
+local function _track_job(st, jid)
+  if type(jid) == "number" and jid > 0 then
+    table.insert(st.search_jobs, jid)
+  end
+end
+
+local function _untrack_job(st, jid)
+  if not st or not st.search_jobs then return end
+  for i, id in ipairs(st.search_jobs) do
+    if id == jid then
+      table.remove(st.search_jobs, i)
+      break
+    end
+  end
+end
+
 --- Match a single filter against the file using rg (async).
 --- on_done() is called when rg exits. filter.match_cache is populated.
+--- Stale callbacks from cancelled/superseded jobs are ignored.
 function M.match_filter(filter, bufnr, on_done)
+  local st = M.state(bufnr)
   local filepath = M.get_filepath(bufnr)
-  if filepath == "" then
-    filter.match_cache = {}
+  filter._match_gen = (filter._match_gen or 0) + 1
+  local gen = filter._match_gen
+  filter.match_cache = {}
+  filter._rg_error = nil
+
+  local function finish()
+    if filter._match_gen ~= gen then return end
     if on_done then on_done() end
+  end
+
+  if filepath == "" then
+    finish()
     return
   end
 
   -- Graceful fallback: if rg is not installed, use Lua loop (small files only)
   if vim.fn.executable("rg") == 0 then
-    filter.match_cache = {}
     if not M.is_large_file(bufnr) then
       local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
       for i, line in ipairs(lines) do
         if filter:matches(line) then filter.match_cache[i] = true end
       end
     end
-    if on_done then on_done() end
+    finish()
     return
   end
 
-  filter.match_cache = {}
   local args = filter_to_rg_args(filter, filepath)
+  local jid
 
-  vim.fn.jobstart(args, {
+  jid = vim.fn.jobstart(args, {
     stdout_buffered = true,
     on_stdout = function(_, data)
-      if not data then return end
+      if filter._match_gen ~= gen or not data then return end
       for _, line in ipairs(data) do
         if line ~= "" then
           local lnum = line:match("^(%d+):")
@@ -155,28 +199,80 @@ function M.match_filter(filter, bufnr, on_done)
         end
       end
     end,
-    on_exit = function()
-      -- rg exits 0 (matches) or 1 (no matches) — both are fine
-      if on_done then on_done() end
+    on_stderr = function(_, data)
+      if filter._match_gen ~= gen or not data then return end
+      for _, line in ipairs(data) do
+        if line ~= "" then
+          filter._rg_error = (filter._rg_error and (filter._rg_error .. "; ") or "") .. line
+        end
+      end
+    end,
+    on_exit = function(_, code)
+      _untrack_job(st, jid)
+      if filter._match_gen ~= gen then return end
+      -- rg: 0 = matches, 1 = no matches, >=2 = error (bad regex, etc.)
+      if code and code > 1 then
+        filter.match_cache = {}
+        filter._rg_error = filter._rg_error or ("rg exit " .. tostring(code))
+        vim.schedule(function()
+          vim.notify(
+            string.format("TextAnalyzer: search failed for '%s' — %s", filter.pattern, filter._rg_error),
+            vim.log.levels.WARN
+          )
+        end)
+      end
+      finish()
     end,
   })
+  _track_job(st, jid)
 end
 
 --- Match all filters in parallel. Calls on_done() when every rg job finishes.
+--- Cancels any previous in-flight searches first.
 function M.match_all_filters(bufnr, on_done)
   local st = M.state(bufnr)
+  M.cancel_search_jobs(bufnr)
+  st.match_gen = (st.match_gen or 0) + 1
+  local gen = st.match_gen
+
   if #st.filters == 0 then
     if on_done then on_done() end
     return
   end
+
   local pending = #st.filters
   local function check()
     pending = pending - 1
-    if pending == 0 and on_done then on_done() end
+    if pending == 0 and st.match_gen == gen and on_done then
+      on_done()
+    end
   end
   for _, filter in ipairs(st.filters) do
     M.match_filter(filter, bufnr, check)
   end
+end
+
+--- Count how many lines a filter currently matches (from cache).
+function M.filter_match_count(filter)
+  local n = 0
+  for _ in pairs(filter.match_cache or {}) do
+    n = n + 1
+  end
+  return n
+end
+
+--- Count currently visible lines (small-file mode).
+function M.visible_count(bufnr)
+  local st = M.state(bufnr)
+  if st.empty_match then return -1 end -- sentinel: unrestricted due to empty match
+  if not st.has_include then
+    return nil -- exclusion-only / show-all; unknown without scanning
+  end
+  local n = 0
+  for _ in pairs(st.visibility or {}) do
+    n = n + 1
+  end
+  return n
 end
 
 -- ── Visibility (small-file mode) ──────────────────────────────────
@@ -185,32 +281,68 @@ function M.recompute_visibility(bufnr)
   if M.is_large_file(bufnr) then return end
   local st = M.state(bufnr)
   local include, exclude, has_include = {}, {}, false
+  local has_broken = false
 
   for _, filter in ipairs(st.filters) do
     if filter.enabled then
+      if filter._rg_error then
+        has_broken = true
+      end
       local cache = filter.match_cache or {}
       if filter.invert then
         for ln in pairs(cache) do exclude[ln] = true end
       else
-        has_include = true
-        for ln in pairs(cache) do include[ln] = true end
+        -- Broken include patterns must not hide the whole buffer
+        if not filter._rg_error then
+          has_include = true
+          for ln in pairs(cache) do include[ln] = true end
+        end
       end
     end
   end
 
+  st.empty_match = false
+
   if has_include then
-    local visible = {}
+    local visible, count = {}, 0
     for ln in pairs(include) do
-      if not exclude[ln] then visible[ln] = true end
+      if not exclude[ln] then
+        visible[ln] = true
+        count = count + 1
+      end
     end
-    st.visibility  = visible
-    st.excluded    = {}
-    st.has_include = true
+
+    if count == 0 then
+      -- Safety net: never leave the user in an all-folded / empty view.
+      -- Keep filters active for editing, but do not restrict visibility.
+      st.visibility  = {}
+      st.excluded    = {}
+      st.has_include = false
+      st.empty_match = true
+
+      local now = vim.loop.hrtime()
+      if (now - (st.last_empty_notify or 0)) > 2e9 then -- 2s throttle
+        st.last_empty_notify = now
+        vim.schedule(function()
+          vim.notify(
+            "TextAnalyzer: 0 matches — showing full file. Toggle/edit filters (\\ta), reset (\\tr), or disable (\\tt).",
+            vim.log.levels.WARN
+          )
+        end)
+      end
+    else
+      st.visibility  = visible
+      st.excluded    = {}
+      st.has_include = true
+    end
   else
-    -- Exclusion-only: store only the excluded lines (tiny table vs 10M-entry table)
+    -- Exclusion-only (or no usable includes): store only excluded lines
     st.visibility  = {}
     st.excluded    = exclude
     st.has_include = false
+    if has_broken then
+      st.empty_match = true
+    end
   end
 end
 
@@ -237,10 +369,21 @@ end
 function M.enable_folds(bufnr)
   if M.is_large_file(bufnr) then return end
   local st  = M.state(bufnr)
+  if not st.enabled then return end
   local win = vim.fn.bufwinid(bufnr)
   if win == -1 then return end
-  st.saved_foldmethod = vim.wo[win].foldmethod
-  st.saved_foldtext   = vim.wo[win].foldtext
+  -- Snapshot once so repeated enable_folds calls don't overwrite with our expr folds
+  if not st.saved_folds then
+    st.saved_folds = {
+      foldmethod  = vim.wo[win].foldmethod,
+      foldexpr    = vim.wo[win].foldexpr,
+      foldtext    = vim.wo[win].foldtext,
+      foldlevel   = vim.wo[win].foldlevel,
+      foldcolumn  = vim.wo[win].foldcolumn,
+      foldenable  = vim.wo[win].foldenable,
+      foldminlines = vim.wo[win].foldminlines,
+    }
+  end
   vim.wo[win].foldmethod = "expr"
   vim.wo[win].foldexpr   = "v:lua.text_analyzer_foldexpr(v:lnum)"
   vim.wo[win].foldtext   = "v:lua.text_analyzer_foldtext()"
@@ -254,10 +397,24 @@ function M.disable_folds(bufnr)
   local st  = M.state(bufnr)
   local win = vim.fn.bufwinid(bufnr)
   if win == -1 then return end
-  vim.wo[win].foldmethod = st.saved_foldmethod or "manual"
-  vim.wo[win].foldtext   = st.saved_foldtext   or ""
-  vim.wo[win].foldlevel  = 99
-  vim.wo[win].foldcolumn = "0"
+  local snap = st.saved_folds
+  if snap then
+    vim.wo[win].foldmethod  = snap.foldmethod
+    vim.wo[win].foldexpr    = snap.foldexpr
+    vim.wo[win].foldtext    = snap.foldtext
+    vim.wo[win].foldlevel   = snap.foldlevel
+    vim.wo[win].foldcolumn  = snap.foldcolumn
+    vim.wo[win].foldenable  = snap.foldenable
+    vim.wo[win].foldminlines = snap.foldminlines
+  else
+    vim.wo[win].foldmethod = "manual"
+    vim.wo[win].foldexpr   = ""
+    vim.wo[win].foldtext   = ""
+    vim.wo[win].foldlevel  = 99
+    vim.wo[win].foldcolumn = "0"
+    vim.wo[win].foldenable = false
+  end
+  st.saved_folds = nil
 end
 
 -- ── Viewport-only Extmarks (small-file mode) ──────────────────────
@@ -318,26 +475,32 @@ function M.populate_large_file_results(bufnr)
   local filepath = vim.b[bufnr].ta_large_file
   if not filepath then return end
 
-  -- Cancel any in-flight jobs
-  for _, jid in ipairs(st.search_jobs) do pcall(vim.fn.jobstop, jid) end
-  st.search_jobs = {}
-  st.results     = {}
-  st.line_map    = {}
+  M.cancel_search_jobs(bufnr)
+  st.match_gen = (st.match_gen or 0) + 1
+  local gen    = st.match_gen
+  st.results   = {}
+  st.line_map  = {}
+  st.byte_map  = {}
+  st.truncated = false
 
   local active = {}
   for _, f in ipairs(st.filters) do
-    if f.enabled and not f.invert then table.insert(active, f) end
+    if f.enabled and not f.invert and not f._rg_error then
+      table.insert(active, f)
+    end
   end
 
-  local size_str  = human_size(vim.fn.getfsize(filepath))
-  local fcount    = #active
+  local size_str    = human_size(vim.fn.getfsize(filepath))
+  local fcount      = #active
+  local max_results = M.config.max_results or 10000
 
   -- Show "Searching…" indicator immediately
   vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
     "  📂 " .. filepath,
-    string.format("  %s  │  %d filter(s)  │  Searching…", size_str, fcount),
+    string.format("  %s  │  %d filter(s)  │  Searching… (cap %d/filter)", size_str, fcount, max_results),
     "",
+    "  Escapes:  \\tt toggle  │  \\tr reset  │  \\ta filter panel",
   })
   vim.bo[bufnr].modifiable = false
 
@@ -350,81 +513,436 @@ function M.populate_large_file_results(bufnr)
       "  Use :TA <pattern> [color]   to search",
       "  Use \\ta                     to open the filter panel",
       "  Use \\tf                     to add a filter interactively",
+      "  Use \\tr                     to reset all filters",
+      "  Use \\tt                     to toggle filtering",
       "",
     })
     vim.bo[bufnr].modifiable = false
+    get_ui().refresh_panel(bufnr)
     return
   end
 
-  -- Collect rg results from all filters in parallel
+  -- Collect rg results from all filters in parallel (capped + byte offsets)
   local all_results = {}
   local pending     = fcount
+  local truncated   = false
 
   for _, filter in ipairs(active) do
+    filter._match_gen = (filter._match_gen or 0) + 1
+    local fgen = filter._match_gen
     filter.match_cache = {}
-    local args = filter_to_rg_args(filter, filepath)
-    local f    = filter  -- capture
+    filter._rg_error = nil
+    local args = filter_to_rg_args(filter, filepath, {
+      byte_offset = true,
+      max_count = max_results,
+    })
+    local f = filter
+    local hits = 0
+    local jid
 
-    local jid = vim.fn.jobstart(args, {
+    jid = vim.fn.jobstart(args, {
+      -- Buffered is safe: --max-count caps output at max_results lines
       stdout_buffered = true,
       on_stdout = function(_, data)
-        if not data then return end
+        if f._match_gen ~= fgen or not data then return end
         for _, line in ipairs(data) do
-          if line ~= "" then
-            local lnum_s, content = line:match("^(%d+):(.*)")
+          if line ~= "" and hits < max_results then
+            -- rg --byte-offset: lnum:byte:content
+            local lnum_s, byte_s, content = line:match("^(%d+):(%d+):(.*)")
+            local lnum, byte
             if lnum_s then
-              local lnum = tonumber(lnum_s)
+              lnum = tonumber(lnum_s)
+              byte = tonumber(byte_s)
+            else
+              local l2, c2 = line:match("^(%d+):(.*)")
+              if l2 then
+                lnum = tonumber(l2)
+                content = c2
+              end
+            end
+            if lnum then
+              hits = hits + 1
               f.match_cache[lnum] = true
-              table.insert(all_results, { line_num = lnum, filter = f, content = content })
+              table.insert(all_results, {
+                line_num = lnum,
+                byte = byte,
+                filter = f,
+                content = content or "",
+              })
+              if hits >= max_results then
+                truncated = true
+              end
             end
           end
         end
       end,
-      on_exit = function()
-        pending = pending - 1
-        if pending == 0 then
+      on_stderr = function(_, data)
+        if f._match_gen ~= fgen or not data then return end
+        for _, line in ipairs(data) do
+          if line ~= "" then
+            f._rg_error = (f._rg_error and (f._rg_error .. "; ") or "") .. line
+          end
+        end
+      end,
+      on_exit = function(_, code)
+        _untrack_job(st, jid)
+        if f._match_gen ~= fgen then return end
+        if hits >= max_results then truncated = true end
+        if code and code > 1 then
+          f.match_cache = {}
+          f._rg_error = f._rg_error or ("rg exit " .. tostring(code))
           vim.schedule(function()
-            M._render_large_results(bufnr, filepath, size_str, all_results, active)
+            vim.notify(
+              string.format("TextAnalyzer: search failed for '%s' — %s", f.pattern, f._rg_error),
+              vim.log.levels.WARN
+            )
+          end)
+        end
+        pending = pending - 1
+        if pending == 0 and st.match_gen == gen then
+          vim.schedule(function()
+            M._render_large_results(bufnr, filepath, size_str, all_results, active, truncated)
           end)
         end
       end,
     })
-    table.insert(st.search_jobs, jid)
+    _track_job(st, jid)
   end
 end
 
-function M._render_large_results(bufnr, filepath, size_str, all_results, active_filters)
+-- ── Context slice (load only ±N lines, never the whole file) ──────
+
+local context_winid = nil
+local context_bufnr = nil
+local CONTEXT_CHUNK = 8192
+
+--- Read [start_ln, end_ln] from filepath via sed/awk (fallback when no byte offset).
+local function _read_line_range(filepath, start_ln, end_ln, on_done)
+  start_ln = math.max(1, start_ln)
+  end_ln = math.max(start_ln, end_ln)
+
+  local cmd
+  if vim.fn.executable("sed") == 1 then
+    cmd = { "sed", "-n", string.format("%d,%dp", start_ln, end_ln), filepath }
+  else
+    cmd = {
+      "awk",
+      "-v", "s=" .. start_ln,
+      "-v", "e=" .. end_ln,
+      "NR>=s { print } NR>=e { exit }",
+      filepath,
+    }
+  end
+
+  local collected = {}
+  vim.fn.jobstart(cmd, {
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      if not data then return end
+      for _, line in ipairs(data) do
+        if line ~= nil then table.insert(collected, line) end
+      end
+      if #collected > 0 and collected[#collected] == "" then
+        table.remove(collected)
+      end
+    end,
+    on_exit = function(_, code)
+      vim.schedule(function()
+        if code ~= 0 and #collected == 0 then
+          on_done(nil, nil, "failed to read lines " .. start_ln .. "-" .. end_ln)
+          return
+        end
+        on_done(collected, start_ln, nil)
+      end)
+    end,
+  })
+end
+
+--- Seek-based ±N line read around a known byte offset (O(window), not O(file)).
+--- Returns lines, start_ln, err (synchronous; call from vim.schedule if needed).
+local function _read_context_at_byte(filepath, byte_offset, center_lnum, context_lines)
+  local f, err = io.open(filepath, "rb")
+  if not f then return nil, nil, err or "cannot open file" end
+
+  local function find_line_start(pos)
+    local search = pos
+    while search > 0 do
+      local from = math.max(0, search - CONTEXT_CHUNK)
+      f:seek("set", from)
+      local chunk = f:read(search - from)
+      if not chunk or chunk == "" then break end
+      local after_nl = chunk:match(".*\n()")
+      if after_nl then
+        return from + after_nl - 1
+      end
+      if from == 0 then return 0 end
+      search = from
+    end
+    return 0
+  end
+
+  local function find_newline_before(pos)
+    local search = pos
+    while search > 0 do
+      local from = math.max(0, search - CONTEXT_CHUNK)
+      f:seek("set", from)
+      local chunk = f:read(search - from)
+      if not chunk or chunk == "" then break end
+      for i = #chunk, 1, -1 do
+        if chunk:sub(i, i) == "\n" then
+          return from + i - 1 -- file offset of the newline
+        end
+      end
+      if from == 0 then return nil end
+      search = from
+    end
+    return nil
+  end
+
+  --- Move back `n` lines from line_start; returns (window_start_byte, lines_moved).
+  local function walk_back_lines(line_start, n)
+    if n <= 0 or line_start <= 0 then return line_start, 0 end
+    local pos = line_start
+    local got = 0
+    for _ = 1, n do
+      local nl = find_newline_before(pos)
+      if not nl then
+        return 0, got
+      end
+      -- Start of the line that ends at nl
+      pos = find_line_start(nl)
+      got = got + 1
+    end
+    return pos, got
+  end
+
+  local function read_n_lines(start_pos, n)
+    f:seek("set", start_pos)
+    local lines = {}
+    local buf = ""
+    while #lines < n do
+      local chunk = f:read(CONTEXT_CHUNK)
+      if not chunk then break end
+      buf = buf .. chunk
+      while #lines < n do
+        local nl = buf:find("\n", 1, true)
+        if not nl then break end
+        table.insert(lines, buf:sub(1, nl - 1))
+        buf = buf:sub(nl + 1)
+      end
+    end
+    if #lines < n and buf ~= "" then
+      table.insert(lines, buf)
+    end
+    return lines
+  end
+
+  local ok, result = pcall(function()
+    local line_start = find_line_start(byte_offset)
+    local window_start, before_got = walk_back_lines(line_start, context_lines)
+    local total = before_got + 1 + context_lines
+    local lines = read_n_lines(window_start, total)
+    local start_ln = math.max(1, center_lnum - before_got)
+    return { lines = lines, start_ln = start_ln }
+  end)
+  f:close()
+
+  if not ok then
+    return nil, nil, tostring(result)
+  end
+  return result.lines, result.start_ln, nil
+end
+
+local function _close_context_win()
+  if context_winid and vim.api.nvim_win_is_valid(context_winid) then
+    pcall(vim.api.nvim_win_close, context_winid, true)
+  end
+  context_winid = nil
+  context_bufnr = nil
+end
+
+--- Open a floating window with only ±context_lines around center_lnum.
+--- byte_offset (optional): rg match byte for O(1)-ish seek; else sed/awk fallback.
+function M.open_context_slice(filepath, center_lnum, context_lines, byte_offset)
+  if not filepath or filepath == "" or not center_lnum then return end
+  context_lines = context_lines or M.config.context_lines or 25
+  context_lines = math.max(1, math.min(context_lines, 500))
+
+  local start_ln = math.max(1, center_lnum - context_lines)
+  local end_ln = center_lnum + context_lines
+
+  _close_context_win()
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  context_bufnr = buf
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+    string.format("  Loading ±%d around line %d…", context_lines, center_lnum),
+  })
+  vim.bo[buf].modifiable = false
+
+  local width = math.min(120, math.max(60, vim.o.columns - 4))
+  local height = math.min(context_lines * 2 + 8, math.max(12, vim.o.lines - 6))
+  local row = math.floor((vim.o.lines - height) / 2)
+  local col = math.floor((vim.o.columns - width) / 2)
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    style = "minimal",
+    border = "rounded",
+    title = string.format(" Context ±%d @ %d ", context_lines, center_lnum),
+    title_pos = "center",
+  })
+  context_winid = win
+  vim.wo[win].cursorline = true
+  vim.wo[win].wrap = false
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  pcall(function() vim.wo[win].winfix = "TA-ctx" end)
+
+  vim.b[buf].ta_ctx = {
+    filepath = filepath,
+    center = center_lnum,
+    context_lines = context_lines,
+    byte = byte_offset,
+  }
+
+  local ns = vim.api.nvim_create_namespace("text-analyzer-context")
+
+  local function render(raw_lines, first_ln)
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    first_ln = first_ln or start_ln
+    local last_ln = first_ln + math.max(0, #raw_lines - 1)
+
+    local header = {
+      string.format("  %s", filepath),
+      string.format(
+        "  lines %d–%d  │  match @ %d  │  +/− widen/narrow  │  q close",
+        first_ln, last_ln, center_lnum
+      ),
+      "  " .. string.rep("─", math.min(72, width - 4)),
+    }
+    local display = vim.deepcopy(header)
+    local match_buf_row = nil
+
+    for i, content in ipairs(raw_lines) do
+      local lnum = first_ln + i - 1
+      local marker = (lnum == center_lnum) and "▶" or " "
+      table.insert(display, string.format("%s %7d │ %s", marker, lnum, content))
+      if lnum == center_lnum then
+        match_buf_row = #display - 1
+      end
+    end
+
+    if #raw_lines == 0 then
+      table.insert(display, "  (no lines in range)")
+    end
+
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, display)
+    vim.bo[buf].modifiable = false
+
+    vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+    if match_buf_row then
+      vim.api.nvim_buf_set_extmark(buf, ns, match_buf_row, 0, {
+        end_row = match_buf_row,
+        end_col = -1,
+        hl_group = "TA_Yellow",
+        priority = 200,
+        strict = false,
+      })
+      if vim.api.nvim_win_is_valid(win) then
+        pcall(vim.api.nvim_win_set_cursor, win, { match_buf_row + 1, 0 })
+      end
+    end
+  end
+
+  local function on_loaded(raw_lines, first_ln, err)
+    if err then
+      vim.notify("TextAnalyzer: " .. err, vim.log.levels.ERROR)
+      _close_context_win()
+      return
+    end
+    render(raw_lines or {}, first_ln)
+  end
+
+  if byte_offset then
+    vim.schedule(function()
+      local lines, first_ln, err = _read_context_at_byte(filepath, byte_offset, center_lnum, context_lines)
+      on_loaded(lines, first_ln, err)
+    end)
+  else
+    _read_line_range(filepath, start_ln, end_ln, on_loaded)
+  end
+
+  local function reload_with(delta)
+    local ctx = vim.b[buf].ta_ctx
+    if not ctx then return end
+    local next_n = math.max(1, math.min(500, ctx.context_lines + delta))
+    M.open_context_slice(ctx.filepath, ctx.center, next_n, ctx.byte)
+  end
+
+  vim.keymap.set("n", "q", _close_context_win, { buffer = buf, nowait = true, desc = "Close context" })
+  vim.keymap.set("n", "<Esc>", _close_context_win, { buffer = buf, nowait = true, desc = "Close context" })
+  vim.keymap.set("n", "+", function() reload_with(25) end, { buffer = buf, nowait = true, desc = "Widen context" })
+  vim.keymap.set("n", "=", function() reload_with(25) end, { buffer = buf, nowait = true, desc = "Widen context" })
+  vim.keymap.set("n", "-", function() reload_with(-25) end, { buffer = buf, nowait = true, desc = "Narrow context" })
+end
+
+function M._render_large_results(bufnr, filepath, size_str, all_results, active_filters, truncated)
   if not vim.api.nvim_buf_is_valid(bufnr) then return end
   local st = M.state(bufnr)
   st.search_jobs = {}
+  st.truncated = truncated and true or false
 
-  -- Sort by line number
   table.sort(all_results, function(a, b) return a.line_num < b.line_num end)
   st.results = all_results
 
-  -- Build display lines
+  local ctx_n = M.config.context_lines or 25
+  local max_results = M.config.max_results or 10000
+
   local header = {
     "  📂 " .. filepath,
     string.format(
-      "  %s  │  %d filter(s)  │  %d matches  │  ENTER: jump to file",
-      size_str, #active_filters, #all_results
+      "  %s  │  %d filter(s)  │  %d matches  │  ENTER/o: context ±%d",
+      size_str, #active_filters, #all_results, ctx_n
     ),
-    "  " .. string.rep("─", 72),
-    "",
   }
+  if truncated then
+    table.insert(header, string.format(
+      "  ⚠ truncated at %d matches/filter — narrow your pattern",
+      max_results
+    ))
+  end
+  table.insert(header, "  " .. string.rep("─", 72))
+  table.insert(header, "")
+
   local HEADER_COUNT = #header
-  local lines   = vim.deepcopy(header)
+  local lines = vim.deepcopy(header)
   local line_map = {}
+  local byte_map = {}
 
   for _, r in ipairs(all_results) do
-    local label   = COLOR_LABELS[r.filter.color] or r.filter.color
+    local label = COLOR_LABELS[r.filter.color] or r.filter.color
     local display = string.format("  [%s]  %7d  │  %s", label, r.line_num, r.content)
     table.insert(lines, display)
     line_map[#lines] = r.line_num
+    byte_map[#lines] = r.byte
   end
 
   if #all_results == 0 then
     table.insert(lines, "  (no matches found)")
+    table.insert(lines, "")
+    table.insert(lines, "  Filters are still active. Escape hatches:")
+    table.insert(lines, "    \\ta  filter panel   \\tr  reset   \\tt  toggle off")
+    table.insert(lines, "    :TADel <n>  delete filter by index")
   end
 
   vim.bo[bufnr].modifiable = true
@@ -432,9 +950,10 @@ function M._render_large_results(bufnr, filepath, size_str, all_results, active_
   vim.bo[bufnr].modifiable = false
 
   st.line_map = line_map
+  st.byte_map = byte_map
   vim.b[bufnr].ta_line_map = line_map
+  vim.b[bufnr].ta_byte_map = byte_map
 
-  -- Apply color extmarks to result lines
   local ns = st.ns_id
   vim.api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
   for buf_lnum, _ in pairs(line_map) do
@@ -450,25 +969,81 @@ function M._render_large_results(bufnr, filepath, size_str, all_results, active_
     end
   end
 
-  -- Enter: jump to the matched line in the real file (read-only view)
-  vim.keymap.set("n", "<CR>", function()
+  local function open_ctx_at_cursor()
     local cur = vim.fn.line(".")
     local orig_lnum = vim.b[bufnr].ta_line_map and vim.b[bufnr].ta_line_map[cur]
     if not orig_lnum then return end
     local real = vim.b[bufnr].ta_large_file
-    vim.cmd("view " .. vim.fn.fnameescape(real))
-    local max = vim.api.nvim_buf_line_count(0)
-    vim.api.nvim_win_set_cursor(0, { math.min(orig_lnum, max), 0 })
-    vim.cmd("normal! zz")
-  end, { buffer = bufnr, desc = "TextAnalyzer: jump to line in file" })
+    if not real then return end
+    local byte = vim.b[bufnr].ta_byte_map and vim.b[bufnr].ta_byte_map[cur]
+    M.open_context_slice(real, orig_lnum, M.config.context_lines, byte)
+  end
 
-  -- q: close results buffer
+  vim.keymap.set("n", "<CR>", open_ctx_at_cursor, { buffer = bufnr, desc = "TextAnalyzer: context slice around match" })
+  vim.keymap.set("n", "o", open_ctx_at_cursor, { buffer = bufnr, desc = "TextAnalyzer: context slice around match" })
+
   vim.keymap.set("n", "q", function()
+    _close_context_win()
     vim.cmd("bdelete")
   end, { buffer = bufnr, desc = "TextAnalyzer: close results" })
 
-  vim.notify(string.format("TextAnalyzer: %d matches across %d filter(s)", #all_results, #active_filters), vim.log.levels.INFO)
+  local msg = string.format("TextAnalyzer: %d matches across %d filter(s)", #all_results, #active_filters)
+  if truncated then
+    msg = msg .. " (truncated)"
+    vim.notify(msg, vim.log.levels.WARN)
+  else
+    vim.notify(msg, vim.log.levels.INFO)
+  end
   get_ui().refresh_panel(bufnr)
+end
+
+--- Open any filepath in large-file analyze mode (never loads full content).
+function M.open_large(filepath)
+  if not filepath or filepath == "" then
+    vim.notify("Usage: TAOpen <filepath>", vim.log.levels.ERROR)
+    return
+  end
+  filepath = vim.fn.fnamemodify(filepath, ":p")
+  if vim.fn.filereadable(filepath) == 0 then
+    vim.notify("TextAnalyzer: file not found: " .. filepath, vim.log.levels.ERROR)
+    return
+  end
+
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(buf)
+  pcall(vim.api.nvim_buf_set_name, buf, "ta://" .. filepath)
+
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = true
+  vim.bo[buf].filetype = "text-analyzer-results"
+  vim.b[buf].ta_large_file = filepath
+
+  M.lighten_buffer(buf)
+  M.state(buf)
+
+  local size = vim.fn.getfsize(filepath)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+    "  📂 " .. filepath,
+    "  " .. human_size(size) .. "  —  Large file mode  (file not loaded into memory)",
+    "",
+    "  Use :TA <pattern> [color]   to search",
+    "  Use \\ta                     to open the filter panel",
+    "  Use \\tf                     to add a filter interactively",
+    "  Use \\tr / \\tt               to reset / toggle filtering",
+    "",
+  })
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].modified = false
+
+  vim.schedule(function()
+    if vim.api.nvim_buf_is_valid(buf) then
+      M._auto_load_filters(buf, filepath)
+    end
+  end)
+
+  vim.notify("TextAnalyzer: opened " .. filepath .. " (large-file mode)", vim.log.levels.INFO)
+  return buf
 end
 
 -- ── Enable / Disable ──────────────────────────────────────────────
@@ -494,11 +1069,12 @@ function M.disable(bufnr)
   local st = M.state(bufnr)
   if not st.enabled then return end
   st.enabled = false
+  st.empty_match = false
+
+  M.cancel_search_jobs(bufnr)
+  st.match_gen = (st.match_gen or 0) + 1
 
   if M.is_large_file(bufnr) then
-    -- Stop any running jobs and restore welcome screen
-    for _, jid in ipairs(st.search_jobs) do pcall(vim.fn.jobstop, jid) end
-    st.search_jobs = {}
     local filepath = vim.b[bufnr].ta_large_file
     vim.bo[bufnr].modifiable = true
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
@@ -506,6 +1082,7 @@ function M.disable(bufnr)
       "  " .. human_size(vim.fn.getfsize(filepath)) .. "  —  Large file mode (filtering disabled)",
       "",
       "  Use :TA <pattern> [color] to re-enable filtering",
+      "  Use \\tt to toggle  │  \\tr to reset  │  \\ta for panel",
     })
     vim.bo[bufnr].modifiable = false
     vim.api.nvim_buf_clear_namespace(bufnr, st.ns_id, 0, -1)
@@ -513,7 +1090,7 @@ function M.disable(bufnr)
     M.disable_folds(bufnr)
     vim.api.nvim_buf_clear_namespace(bufnr, st.ns_id, 0, -1)
   end
-  vim.notify("TextAnalyzer: filtering disabled", vim.log.levels.INFO)
+  vim.notify("TextAnalyzer: filtering disabled — full file visible", vim.log.levels.INFO)
 end
 
 function M.toggle(bufnr)
@@ -627,27 +1204,73 @@ end
 function M.reset(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local st = M.state(bufnr)
-  -- Cancel in-flight jobs
-  for _, jid in ipairs(st.search_jobs) do pcall(vim.fn.jobstop, jid) end
+  local was_enabled = st.enabled
+
+  M.cancel_search_jobs(bufnr)
+  st.match_gen   = (st.match_gen or 0) + 1
   st.filters     = {}
   st.visibility  = {}
   st.excluded    = {}
   st.has_include = false
+  st.empty_match = false
   st.results     = {}
   st.line_map    = {}
-  st.search_jobs = {}
+  st.byte_map    = {}
+  st.truncated   = false
 
-  if st.enabled then
-    if M.is_large_file(bufnr) then
-      M.populate_large_file_results(bufnr)
-    else
-      vim.api.nvim_buf_clear_namespace(bufnr, st.ns_id, 0, -1)
-      M.recompute_visibility(bufnr)
-      vim.cmd("redraw!")
-    end
+  -- Fully tear down filtering so the buffer is never left "stuck" folded
+  if was_enabled then
+    M.disable(bufnr)
+  elseif not M.is_large_file(bufnr) then
+    vim.api.nvim_buf_clear_namespace(bufnr, st.ns_id, 0, -1)
   end
   get_ui().refresh_panel(bufnr)
-  vim.notify("TextAnalyzer: all filters cleared", vim.log.levels.INFO)
+  vim.notify("TextAnalyzer: all filters cleared — full file visible", vim.log.levels.INFO)
+end
+
+--- Toggle invert flag on a filter (exclude ↔ include).
+function M.toggle_invert(bufnr, idx)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local st = M.state(bufnr)
+  if idx < 1 or idx > #st.filters then return end
+  st.filters[idx].invert = not st.filters[idx].invert
+  _refresh(bufnr)
+end
+
+--- Update a filter's pattern and re-run matching.
+function M.set_filter_pattern(bufnr, idx, new_pattern)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local st = M.state(bufnr)
+  if idx < 1 or idx > #st.filters then return end
+  if not new_pattern or new_pattern == "" then return end
+  local filter = st.filters[idx]
+  filter:set_pattern(new_pattern)
+  filter.name = new_pattern
+  if M.is_large_file(bufnr) then
+    _refresh(bufnr)
+  else
+    M.match_filter(filter, bufnr, function()
+      vim.schedule(function() _refresh(bufnr) end)
+    end)
+  end
+end
+
+--- Cycle filter color forward.
+function M.cycle_filter_color(bufnr, idx)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local st = M.state(bufnr)
+  if idx < 1 or idx > #st.filters then return end
+  local colors = Filter.COLORS
+  local cur = st.filters[idx].color
+  local next_i = 1
+  for i, c in ipairs(colors) do
+    if c == cur then
+      next_i = (i % #colors) + 1
+      break
+    end
+  end
+  st.filters[idx].color = colors[next_i]
+  _refresh(bufnr)
 end
 
 -- ── Auto-load Filter Sets ─────────────────────────────────────────
@@ -715,6 +1338,14 @@ function M._register_commands()
   vim.api.nvim_create_user_command("TAFilterList", function() get_storage().list_filter_sets() end, { desc = "List filter sets" })
   vim.api.nvim_create_user_command("TAWorkspaceList", function() get_storage().list_workspaces() end, { desc = "List workspaces" })
 
+  vim.api.nvim_create_user_command("TAOpen", function(opts)
+    M.open_large(opts.args)
+  end, {
+    nargs = 1,
+    complete = "file",
+    desc = "Open any file in TextAnalyzer large-file mode (no full load)",
+  })
+
   vim.api.nvim_create_user_command("TAList", function()
     local bufnr = vim.api.nvim_get_current_buf()
     local st    = M.state(bufnr)
@@ -772,6 +1403,11 @@ function M._register_keymaps()
   vim.keymap.set("n", "<leader>ts", function() get_ui().show_stats() end,       { desc = "TextAnalyzer: Statistics" })
   vim.keymap.set("n", "<leader>tr", function() M.reset() end,                   { desc = "TextAnalyzer: Reset filters" })
   vim.keymap.set("n", "<leader>tl", function() get_ui().show_legend() end,      { desc = "TextAnalyzer: Color legend" })
+  vim.keymap.set("n", "<leader>to", function()
+    vim.ui.input({ prompt = "TAOpen file: ", completion = "file" }, function(path)
+      if path and path ~= "" then M.open_large(path) end
+    end)
+  end, { desc = "TextAnalyzer: Open file (large-file mode)" })
 end
 
 -- ── Autocmds ─────────────────────────────────────────────────────
@@ -811,6 +1447,7 @@ function M._register_autocmds()
           "  Use :TA <pattern> [color]   to search",
           "  Use \\ta                     to open the filter panel",
           "  Use \\tf                     to add a filter interactively",
+          "  Use \\tr / \\tt               to reset / toggle filtering",
           "",
         })
         vim.bo[args.buf].modifiable = false

@@ -43,6 +43,8 @@ return {
         auto_load = {},
         enable_filetypes = { "log", "txt" },
         lighten_buffers = true,
+        context_lines = 25,
+        max_results = 10000,
       }
       local user_config = vim.g.text_analyzer_config or {}
       local opts = vim.tbl_deep_extend("keep", user_config, default_config)
