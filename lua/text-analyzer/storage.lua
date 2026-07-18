@@ -118,15 +118,23 @@ function Storage.load_into_buffer(bufnr, name)
     table.insert(st.filters, Filter.from_table(ft))
   end
 
-  -- Recompute
-  core.match_all_filters(bufnr)
-  if st.enabled then
-    core.recompute_visibility(bufnr)
-    core.apply_highlights(bufnr)
-    vim.cmd("redraw!")
-  end
+  -- Recompute (async — rg runs in background)
+  local filter_count = #st.filters
+  core.match_all_filters(bufnr, function()
+    vim.schedule(function()
+      if st.enabled then
+        if core.is_large_file(bufnr) then
+          core.populate_large_file_results(bufnr)
+        else
+          core.recompute_visibility(bufnr)
+          core.apply_highlights(bufnr)
+          vim.cmd("redraw!")
+        end
+      end
+    end)
+  end)
 
-  vim.notify("TextAnalyzer: loaded filter set '" .. name .. "' (" .. #st.filters .. " filters)", vim.log.levels.INFO)
+  vim.notify("TextAnalyzer: loaded filter set '" .. name .. "' (" .. filter_count .. " filters)", vim.log.levels.INFO)
 end
 
 --- Merge a named filter set into the current buffer's filters.
@@ -162,14 +170,21 @@ function Storage.merge_into_buffer(bufnr, name)
     table.insert(st.filters, Filter.from_table(ft))
   end
 
-  core.match_all_filters(bufnr)
-  if st.enabled then
-    core.recompute_visibility(bufnr)
-    core.apply_highlights(bufnr)
-    vim.cmd("redraw!")
-  end
-
   local added = #st.filters - start_count
+  core.match_all_filters(bufnr, function()
+    vim.schedule(function()
+      if st.enabled then
+        if core.is_large_file(bufnr) then
+          core.populate_large_file_results(bufnr)
+        else
+          core.recompute_visibility(bufnr)
+          core.apply_highlights(bufnr)
+          vim.cmd("redraw!")
+        end
+      end
+    end)
+  end)
+
   vim.notify("TextAnalyzer: merged " .. added .. " filters from '" .. name .. "'", vim.log.levels.INFO)
 end
 
@@ -403,22 +418,29 @@ function Storage.load_workspace(name)
   st.context_mode = data.context_mode or "all"
   st.enabled = data.enabled ~= false
 
-  -- Recompute
-  core.match_all_filters(bufnr)
-  if st.enabled then
-    core.recompute_visibility(bufnr)
-    core.enable_folds(bufnr)
-    core.apply_highlights(bufnr)
-
-    -- Restore scroll position
-    if data.scroll and data.scroll.row then
-      local winid = vim.fn.bufwinid(bufnr)
-      if winid ~= -1 then
-        pcall(vim.api.nvim_win_set_cursor, winid, { data.scroll.row, data.scroll.col or 0 })
-        vim.cmd("normal! zz")
+  -- Recompute (async)
+  local scroll = data.scroll
+  core.match_all_filters(bufnr, function()
+    vim.schedule(function()
+      if st.enabled then
+        if core.is_large_file(bufnr) then
+          core.populate_large_file_results(bufnr)
+        else
+          core.recompute_visibility(bufnr)
+          core.enable_folds(bufnr)
+          core.apply_highlights(bufnr)
+        end
+        -- Restore scroll position
+        if scroll and scroll.row then
+          local winid = vim.fn.bufwinid(bufnr)
+          if winid ~= -1 then
+            pcall(vim.api.nvim_win_set_cursor, winid, { scroll.row, scroll.col or 0 })
+            vim.cmd("normal! zz")
+          end
+        end
       end
-    end
-  end
+    end)
+  end)
 
   vim.notify("TextAnalyzer: workspace '" .. name .. "' loaded (" .. #st.filters .. " filters)", vim.log.levels.INFO)
 end
