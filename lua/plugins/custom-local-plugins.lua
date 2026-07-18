@@ -9,7 +9,7 @@ return {
       "kkharji/sqlite.lua",
       "ibhagwan/fzf-lua",
     },
-    event = { "BufReadPre", "BufNewFile" },
+    event = { "BufReadPre", "BufNewFile", "InsertEnter" },
     config = function()
       -- 1. Setup Codemarks
       local ok_cm, codemarks = pcall(require, "codemarks")
@@ -55,6 +55,26 @@ return {
         vim.g.text_analyzer_loaded = true
       else
         vim.notify("TextAnalyzer: failed to load text-analyzer module", vim.log.levels.ERROR)
+      end
+
+      -- 3. Setup Typist (WPM + spell-learn + cmp source)
+      local typist_defaults = {
+        show_wpm = true,
+        update_time = 300,
+        min_word_len = 3,
+        learn_without_spell = true,
+        enable_spell_learn = { "markdown", "text", "gitcommit", "org", "mail" },
+        cmp = { enable = true, max_items = 20 },
+      }
+      local typist_user = vim.g.typist_config or {}
+      local typist_opts = vim.tbl_deep_extend("force", typist_defaults, typist_user)
+
+      local ok_ty, typist = pcall(require, "typist")
+      if ok_ty then
+        typist.setup(typist_opts)
+        vim.g.typist_loaded = true
+      else
+        vim.notify("Typist: failed to load typist module: " .. tostring(typist), vim.log.levels.ERROR)
       end
     end,
   }
