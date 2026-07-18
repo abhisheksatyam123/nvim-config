@@ -53,9 +53,9 @@ local function register_commands()
 end
 
 local function register_keymaps()
-  -- Avoid TextAnalyzer <leader>tt — use ty / tY
-  vim.keymap.set("n", "<leader>ty", function() M.stats() end, { desc = "Typist: Stats" })
-  vim.keymap.set("n", "<leader>tY", function() M.toggle() end, { desc = "Typist: Toggle tracking" })
+  -- Stay off <leader>t* (tabs, TextAnalyzer, gitsigns blame)
+  vim.keymap.set("n", "<leader>ys", function() M.stats() end, { desc = "Typist: Stats" })
+  vim.keymap.set("n", "<leader>yt", function() M.toggle() end, { desc = "Typist: Toggle tracking" })
 end
 
 local function register_autocmds()
@@ -146,6 +146,10 @@ function M.stats()
 
   table.insert(chunks, {
     "\n  :TypistAdd <word>  :TypistIgnore <wrong>  :TypistToggle\n",
+    "Comment",
+  })
+  table.insert(chunks, {
+    "  \\ys stats  │  \\yt toggle\n",
     "Comment",
   })
 
