@@ -39,9 +39,15 @@ return {
 
       -- === Bordered hover/signature ===
       vim.lsp.handlers["textDocument/hover"] =
-        vim.lsp.with(vim.lsp.handlers.hover, { border = "rounded" })
+        function(err, result, ctx, config)
+          config = vim.tbl_extend("force", config or {}, { border = "rounded" })
+          vim.lsp.handlers.hover(err, result, ctx, config)
+        end
       vim.lsp.handlers["textDocument/signatureHelp"] =
-        vim.lsp.with(vim.lsp.handlers.signature_help, { border = "rounded" })
+        function(err, result, ctx, config)
+          config = vim.tbl_extend("force", config or {}, { border = "rounded" })
+          vim.lsp.handlers.signature_help(err, result, ctx, config)
+        end
 
       -- === LspAttach: common keymaps ===
       vim.api.nvim_create_autocmd("LspAttach", {
